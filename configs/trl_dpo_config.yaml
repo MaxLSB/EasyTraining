@@ -1,0 +1,72 @@
+# TRL DPO training config
+# Derived from axolotl_config.yaml
+
+model:
+  name: Qwen/Qwen3-4B-Thinking-2507
+  load_in_4bit: false
+  attn_implementation: flash_attention_2
+
+datasets:
+  - name: lightonai/DPO_Native_Reasoning_FR_EN_chat_template
+    split: train
+    column_map:
+      prompt: prompt
+      chosen: chosen
+      rejected: rejected
+
+validation:
+  split_ratio: 0.01
+  seed: 42  
+
+training:
+  output_dir: /opt/home/maxence/EasyTraining/training_results/dpo_test
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_train_epochs: 1
+  learning_rate: 1e-5
+  warmup_ratio: 0.1
+  lr_scheduler_type: linear
+  weight_decay: 0.01
+  logging_steps: 1
+  save_strategy: epoch
+  eval_strategy: steps
+  eval_steps: 50
+  report_to: wandb
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+  optim: adamw_torch
+  max_grad_norm: 1.0
+
+dpo:
+  beta: 0.5
+  loss_type: sigmoid
+  max_length: 16384
+  max_prompt_length: 4096
+  # precompute_ref_log_probs: true
+  dataset_num_proc: 8
+
+lora:
+  enabled: true
+  r: 32                    
+  alpha: 64
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+eval_samples:
+  enabled: true
+  num_samples: 5
+  max_new_tokens: 500
+
+wandb:
+  enabled: true
+  project: EUReasoning
+  run_name: dpo_test

@@ -1,0 +1,19 @@
+[project]
+name = "easytraining"
+version = "0.1.0"
+description = "Config-driven DPO & SFT training with TRL"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch==2.10.0",
+    "transformers==5.1.0",
+    "trl==0.28.0",
+    "datasets==4.5.0",
+    "accelerate==1.12.0",
+    "peft==0.18.1",
+    "bitsandbytes==0.49.1",
+    "pyyaml==6.0.3",
+    "wandb==0.24.2",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.12/flash_attn-2.8.3%2Bcu128torch2.10-cp311-cp311-linux_x86_64.whl",
+]
+

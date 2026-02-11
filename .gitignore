@@ -1,0 +1,8 @@
+.python-version
+.venv/
+venv/
+env/
+venv/
+*.egg-info
+src/easytraining.egg-info
+.claude
