@@ -1,12 +1,12 @@
 # TRL SFT training config
 
 model:
-  name: Qwen/Qwen3-4B
+  name: Qwen/Qwen3-4B-Thinking-2507
   attn_implementation: flash_attention_2
 
 datasets:
-  - name: HuggingFaceH4/ultrachat_200k
-    split: train_sft
+  - name: kurakurai/scholar
+    split: scholar_all
     column_map:
       conversations: messages
 
@@ -15,46 +15,51 @@ validation:
   seed: 42
 
 training:
-  output_dir: ./outputs/sft_test
+  output_dir: /opt/home/maxence/EasyTraining/training_results/sft_test
   per_device_train_batch_size: 2
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 4
   num_train_epochs: 1
   learning_rate: 2e-5
-  warmup_ratio: 0.1
+  warmup_steps: 50
   lr_scheduler_type: cosine
   weight_decay: 0.01
   logging_steps: 1
   save_strategy: epoch
   eval_strategy: steps
-  eval_steps: 100
+  eval_steps: 50
   report_to: wandb
   bf16: true
-  gradient_checkpointing: true
+  # gradient_checkpointing: true  # use activation_checkpointing in fsdp_config instead with FSDP
   optim: adamw_torch
   max_grad_norm: 1.0
-  max_seq_length: 4096
   packing: true
   dataset_num_proc: 8
+  max_seq_length: 4096
 
-lora:
-  enabled: true
-  r: 32
-  alpha: 64
-  dropout: 0.05
-  target_modules:
-    - q_proj
-    - k_proj
-    - v_proj
-    - o_proj
-    - gate_proj
-    - up_proj
-    - down_proj
+  fsdp: full_shard auto_wrap
+  fsdp_config:
+    fsdp_version: 2
+    activation_checkpointing: true
+  
+# lora:
+#   enabled: true
+#   r: 32
+#   alpha: 64
+#   dropout: 0.05
+#   target_modules:
+#     - q_proj
+#     - k_proj
+#     - v_proj
+#     - o_proj
+#     - gate_proj
+#     - up_proj
+#     - down_proj
 
 eval_samples:
   enabled: true
-  num_samples: 5
-  max_new_tokens: 500
+  num_samples: 3
+  max_new_tokens: 256
 
 wandb:
   enabled: true

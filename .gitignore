@@ -6,3 +6,6 @@ venv/
 *.egg-info
 src/easytraining.egg-info
 .claude
+wandb/
+logs/
+training_results/

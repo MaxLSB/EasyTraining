@@ -2,6 +2,7 @@ import os
 import yaml
 import argparse
 import random
+import traceback
 
 import torch
 from datasets import load_dataset, concatenate_datasets, load_from_disk
@@ -212,7 +213,6 @@ def build_sft_config(config):
         num_train_epochs=train_cfg.get("num_train_epochs", 1),
         max_steps=train_cfg.get("max_steps", -1),
         learning_rate=float(train_cfg.get("learning_rate", 2e-5)),
-        warmup_ratio=train_cfg.get("warmup_ratio", 0.0),
         warmup_steps=train_cfg.get("warmup_steps", 0),
         lr_scheduler_type=train_cfg.get("lr_scheduler_type", "cosine"),
         weight_decay=train_cfg.get("weight_decay", 0.0),
@@ -234,7 +234,7 @@ def build_sft_config(config):
         fsdp_config=train_cfg.get("fsdp_config", {}),
         model_init_kwargs=model_init_kwargs,
         # SFT
-        max_seq_length=train_cfg.get("max_seq_length", 4096),
+        max_length=train_cfg.get("max_seq_length", train_cfg.get("max_length", 4096)),
         packing=train_cfg.get("packing", False),
         dataset_num_proc=train_cfg.get("dataset_num_proc"),
         dataset_text_field=train_cfg.get("dataset_text_field"),
@@ -265,9 +265,10 @@ class EvalSampleLoggerCallback(TrainerCallback):
                     reference = m["content"]
                 else:
                     prompt_msgs.append(m)
-            input_ids = self.tokenizer.apply_chat_template(
+            out = self.tokenizer.apply_chat_template(
                 prompt_msgs, return_tensors="pt", add_generation_prompt=True
             )
+            input_ids = out if isinstance(out, torch.Tensor) else out["input_ids"]
             return input_ids, reference
 
         # Text format: use first half as prompt
@@ -277,28 +278,45 @@ class EvalSampleLoggerCallback(TrainerCallback):
         reference = self.tokenizer.decode(tokens[0][mid:], skip_special_tokens=True)
         return tokens[:, :mid], reference
 
+    @staticmethod
+    def _unwrap(model):
+        while hasattr(model, "module"):
+            model = model.module
+        return model
+
     def on_evaluate(self, args, state, control, model=None, **kwargs):
-        if int(os.environ.get("RANK", 0)) != 0 or model is None:
+        if model is None:
             return
 
-        model.eval()
-        if hasattr(model, "config"):
-            model.config.use_cache = True
+        is_main = int(os.environ.get("RANK", 0)) == 0
+        unwrapped = self._unwrap(model)
+        unwrapped.eval()
+
+        had_gc = getattr(unwrapped, "gradient_checkpointing", False)
+        if had_gc:
+            unwrapped.gradient_checkpointing_disable()
+        unwrapped.config.use_cache = True
+
+        device = next(unwrapped.parameters()).device
 
         rows = []
         for sample in self.samples:
             try:
                 input_ids, reference = self._extract_prompt_and_reference(sample)
-                input_ids = input_ids.to(model.device)
+                input_ids = input_ids.to(device) if isinstance(input_ids, torch.Tensor) else input_ids
                 prompt_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)[:500]
 
+                attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
                 with torch.no_grad():
-                    out = model.generate(
-                        input_ids, max_new_tokens=self.max_new_tokens,
+                    out = unwrapped.generate(
+                        input_ids, attention_mask=attention_mask,
+                        max_new_tokens=self.max_new_tokens,
                         do_sample=False, pad_token_id=self.tokenizer.pad_token_id,
+                        temperature=None, top_p=None, top_k=None,
                     )
                 generated = self.tokenizer.decode(out[0][input_ids.shape[-1]:], skip_special_tokens=True)[:500]
             except Exception as e:
+                traceback.print_exc()
                 prompt_text = str(sample)[:200]
                 reference = ""
                 generated = f"[generation failed: {e}]"
@@ -306,16 +324,18 @@ class EvalSampleLoggerCallback(TrainerCallback):
             row = {"prompt": prompt_text[:500], "reference": reference[:500], "generated": generated}
             rows.append(row)
 
-            print(f"\n{'='*80}")
-            print(f"[Eval sample - step {state.global_step}]")
-            for k in ("prompt", "reference", "generated"):
-                print(f"{k.upper():10s} {row[k][:300]}")
-            print("=" * 80)
+            if is_main:
+                print(f"\n{'='*80}")
+                print(f"[Eval sample - step {state.global_step}]")
+                for k in ("prompt", "reference", "generated"):
+                    print(f"{k.upper():10s} {row[k][:300]}")
+                print("=" * 80)
 
-        if hasattr(model, "config"):
-            model.config.use_cache = False
+        unwrapped.config.use_cache = False
+        if had_gc:
+            unwrapped.gradient_checkpointing_enable()
 
-        if self.use_wandb:
+        if is_main and self.use_wandb:
             try:
                 import wandb
                 if wandb.run:

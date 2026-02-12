@@ -2,6 +2,7 @@ import os
 import yaml
 import argparse
 import random
+import traceback
 
 import torch
 from datasets import load_dataset, concatenate_datasets, load_from_disk
@@ -104,12 +105,14 @@ def load_datasets(config):
 def filter_overlength(ds, tokenizer, max_length, num_proc=8):
     def token_len(text):
         if is_chat_format(text):
-            return len(tokenizer.apply_chat_template(text, tokenize=True))
+            rendered = tokenizer.apply_chat_template(text, tokenize=False)
+            return len(tokenizer(rendered, add_special_tokens=False)["input_ids"])
         return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
     def fits(ex):
-        p = token_len(ex["prompt"])
-        return max(p + token_len(ex["chosen"]), p + token_len(ex["rejected"])) <= max_length
+        full_chosen = ex["prompt"] + ex["chosen"] if is_chat_format(ex["prompt"]) else ex["prompt"] + ex["chosen"]
+        full_rejected = ex["prompt"] + ex["rejected"] if is_chat_format(ex["prompt"]) else ex["prompt"] + ex["rejected"]
+        return max(token_len(full_chosen), token_len(full_rejected)) <= max_length
 
     before = len(ds)
     ds = ds.filter(fits, num_proc=num_proc)
@@ -132,12 +135,6 @@ def load_model(config):
     train_cfg = config.get("training", {})
     model_name = model_cfg["name"]
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
-    # FSDP: let DPOTrainer handle model loading and wrapping
-    fsdp = train_cfg.get("fsdp")
-    if fsdp and fsdp != "" and fsdp != []:
-        print(f"[Rank {local_rank}] FSDP: deferring model load to DPOTrainer")
-        return model_name
 
     torch_dtype = get_torch_dtype(train_cfg)
     is_ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
@@ -196,17 +193,11 @@ def build_dpo_config(config):
     if use_bf16 and not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()):
         use_bf16, use_fp16 = False, True
 
-    # FSDP model init kwargs
     fsdp = train_cfg.get("fsdp")
-    model_init_kwargs = None
-    if fsdp:
-        model_init_kwargs = {"trust_remote_code": True, "dtype": get_torch_dtype(train_cfg)}
-        model_cfg = config.get("model", {})
-        if model_cfg.get("attn_implementation"):
-            model_init_kwargs["attn_implementation"] = model_cfg["attn_implementation"]
-        if model_cfg.get("rope_scaling"):
-            model_init_kwargs["rope_scaling"] = model_cfg["rope_scaling"]
 
+    model_init_kwargs = None
+    ref_model_init_kwargs = None
+    
     return DPOConfig(
         # Training
         output_dir=train_cfg.get("output_dir", "./outputs/dpo"),
@@ -215,7 +206,7 @@ def build_dpo_config(config):
         gradient_accumulation_steps=train_cfg.get("gradient_accumulation_steps", 1),
         num_train_epochs=train_cfg.get("num_train_epochs", 1),
         learning_rate=float(train_cfg.get("learning_rate", 5e-6)),
-        warmup_ratio=train_cfg.get("warmup_ratio", 0.0),
+        warmup_steps=train_cfg.get("warmup_steps", 0),
         lr_scheduler_type=train_cfg.get("lr_scheduler_type", "linear"),
         weight_decay=train_cfg.get("weight_decay", 0.0),
         logging_steps=train_cfg.get("logging_steps", 1),
@@ -234,13 +225,11 @@ def build_dpo_config(config):
         fsdp=fsdp or "",
         fsdp_config=train_cfg.get("fsdp_config", {}),
         model_init_kwargs=model_init_kwargs,
-        ref_model_init_kwargs=dict(model_init_kwargs) if model_init_kwargs else None,
+        ref_model_init_kwargs=ref_model_init_kwargs,
         # DPO
         beta=dpo_cfg.get("beta", 0.1),
         loss_type=dpo_cfg.get("loss_type", "sigmoid"),
         max_length=dpo_cfg.get("max_length", 1024),
-        max_prompt_length=dpo_cfg.get("max_prompt_length", 512),
-        max_completion_length=dpo_cfg.get("max_completion_length"),
         truncation_mode=dpo_cfg.get("truncation_mode", "keep_end"),
         precompute_ref_log_probs=dpo_cfg.get("precompute_ref_log_probs", False),
         dataset_num_proc=dpo_cfg.get("dataset_num_proc"),
@@ -262,7 +251,8 @@ class EvalSampleLoggerCallback(TrainerCallback):
 
     def _prompt_to_ids(self, prompt):
         if is_chat_format(prompt):
-            return self.tokenizer.apply_chat_template(prompt, return_tensors="pt", add_generation_prompt=True)
+            out = self.tokenizer.apply_chat_template(prompt, return_tensors="pt", add_generation_prompt=True)
+            return out if isinstance(out, torch.Tensor) else out["input_ids"]
         return self.tokenizer(prompt, return_tensors="pt")["input_ids"]
 
     def _truncate(self, text, max_chars=500):
@@ -272,41 +262,61 @@ class EvalSampleLoggerCallback(TrainerCallback):
             return "\n".join(f'{m["role"]}: {m.get("content","")}' for m in text)[:max_chars]
         return str(text)[:max_chars]
 
+    @staticmethod
+    def _unwrap(model):
+        while hasattr(model, "module"):
+            model = model.module
+        return model
+
     def on_evaluate(self, args, state, control, model=None, **kwargs):
-        if int(os.environ.get("RANK", 0)) != 0 or model is None:
+        if model is None:
             return
 
-        model.eval()
-        if hasattr(model, "config"):
-            model.config.use_cache = True
+        is_main = int(os.environ.get("RANK", 0)) == 0
+        unwrapped = self._unwrap(model)
+        unwrapped.eval()
+
+        # Temporarily enable cache and disable gradient checkpointing for generation
+        had_gc = getattr(unwrapped, "gradient_checkpointing", False)
+        if had_gc:
+            unwrapped.gradient_checkpointing_disable()
+        unwrapped.config.use_cache = True
+
+        device = next(unwrapped.parameters()).device
 
         rows = []
         for sample in self.samples:
             try:
-                input_ids = self._prompt_to_ids(sample["prompt"]).to(model.device)
+                input_ids = self._prompt_to_ids(sample["prompt"]).to(device)
+                attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
                 with torch.no_grad():
-                    out = model.generate(
-                        input_ids, max_new_tokens=self.max_new_tokens,
+                    out = unwrapped.generate(
+                        input_ids, attention_mask=attention_mask,
+                        max_new_tokens=self.max_new_tokens,
                         do_sample=False, pad_token_id=self.tokenizer.pad_token_id,
+                        temperature=None, top_p=None, top_k=None,
                     )
                 generated = self.tokenizer.decode(out[0][input_ids.shape[-1]:], skip_special_tokens=True)[:500]
             except Exception as e:
+                traceback.print_exc()
                 generated = f"[generation failed: {e}]"
 
             row = {k: self._truncate(sample[k]) for k in ("prompt", "chosen", "rejected")}
             row["generated"] = generated
             rows.append(row)
 
-            print(f"\n{'='*80}")
-            print(f"[Eval sample - step {state.global_step}]")
-            for k in ("prompt", "chosen", "rejected", "generated"):
-                print(f"{k.upper():10s} {row[k][:300]}")
-            print("=" * 80)
+            if is_main:
+                print(f"\n{'='*80}")
+                print(f"[Eval sample - step {state.global_step}]")
+                for k in ("prompt", "chosen", "rejected", "generated"):
+                    print(f"{k.upper():10s} {row[k][:300]}")
+                print("=" * 80)
 
-        if hasattr(model, "config"):
-            model.config.use_cache = False
+        unwrapped.config.use_cache = False
+        if had_gc:
+            unwrapped.gradient_checkpointing_enable()
 
-        if self.use_wandb:
+        if is_main and self.use_wandb:
             try:
                 import wandb
                 if wandb.run:

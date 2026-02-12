@@ -8,7 +8,7 @@ model:
 
 datasets:
   - name: lightonai/DPO_Native_Reasoning_FR_EN_chat_template
-    split: train
+    split: train[:5%]
     column_map:
       prompt: prompt
       chosen: chosen
@@ -25,48 +25,52 @@ training:
   gradient_accumulation_steps: 8
   num_train_epochs: 1
   learning_rate: 1e-5
-  warmup_ratio: 0.1
+  warmup_steps: 50
   lr_scheduler_type: linear
   weight_decay: 0.01
   logging_steps: 1
   save_strategy: epoch
   eval_strategy: steps
-  eval_steps: 50
+  eval_steps: 10
   report_to: wandb
   bf16: true
   fp16: false
-  gradient_checkpointing: true
   optim: adamw_torch
   max_grad_norm: 1.0
+  gradient_checkpointing: true  # use activation_checkpointing instead with FSDP
+  # fsdp: full_shard auto_wrap
+  # fsdp_config:
+  #   fsdp_version: 2
+  #   activation_checkpointing: true
 
 dpo:
-  beta: 0.5
+  beta: 0.1
   loss_type: sigmoid
-  max_length: 16384
-  max_prompt_length: 4096
-  # precompute_ref_log_probs: true
+  max_length: 4096
+  # max_prompt_length: 4096
+  precompute_ref_log_probs: true  # REQUIRED with FSDP2
   dataset_num_proc: 8
 
-lora:
-  enabled: true
-  r: 32                    
-  alpha: 64
-  dropout: 0.05
-  target_modules:
-    - q_proj
-    - k_proj
-    - v_proj
-    - o_proj
-    - gate_proj
-    - up_proj
-    - down_proj
+# lora:
+#   enabled: true
+#   r: 32                    
+#   alpha: 64
+#   dropout: 0.05
+#   target_modules:
+#     - q_proj
+#     - k_proj
+#     - v_proj
+#     - o_proj
+#     - gate_proj
+#     - up_proj
+#     - down_proj
 
 eval_samples:
   enabled: true
-  num_samples: 5
-  max_new_tokens: 500
+  num_samples: 3
+  max_new_tokens: 256
 
 wandb:
   enabled: true
-  project: EUReasoning
+  project: EasyTraining
   run_name: dpo_test
