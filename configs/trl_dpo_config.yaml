@@ -1,5 +1,4 @@
 # TRL DPO training config
-# Derived from axolotl_config.yaml
 
 model:
   name: Qwen/Qwen3-4B-Thinking-2507

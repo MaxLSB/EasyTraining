@@ -9,3 +9,4 @@ src/easytraining.egg-info
 wandb/
 logs/
 training_results/
+**/__pycache__/

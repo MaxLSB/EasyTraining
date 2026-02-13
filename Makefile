@@ -15,13 +15,19 @@ $(VENV)/bin/activate:
 	@echo "\n✅ Environment ready. Activate with: source $(VENV)/bin/activate"
 
 # ── Training ─────────────────────────────────────────────────────────
-.PHONY: dpo sft
+.PHONY: dpo sft sdft sdft-vllm
 
 dpo:  ## Run DPO training (single GPU)
 	$(PYTHON_VENV) src/dpo/trl_dpo.py --config $(CONFIG)
 
 sft:  ## Run SFT training (single GPU)
 	$(PYTHON_VENV) src/sft/trl_sft.py --config $(CONFIG)
+
+sdft:  ## Run SDFT training (single GPU)
+	$(PYTHON_VENV) src/selfdistillation/sdft.py --config $(CONFIG)
+
+sdft-vllm:  ## Run SDFT training with vLLM generation
+	$(PYTHON_VENV) src/selfdistillation/sdft_vllm.py --config $(CONFIG)
 
 # ── Clean ────────────────────────────────────────────────────────────
 .PHONY: clean
