@@ -8,7 +8,7 @@ import copy
 import time
 import logging
 
-logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+# logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger("sdft")
 
 import torch
@@ -252,9 +252,8 @@ class SDFTTrainer(Trainer):
     along the student's own generated trajectories.
     """
 
-    def __init__(self, tokenizer, sdft_config, **kwargs):
-        super().__init__(**kwargs)
-        self.tokenizer = tokenizer
+    def __init__(self, processing_class, sdft_config, **kwargs):
+        super().__init__(processing_class=processing_class, **kwargs)
         self.sdft_config = sdft_config
 
         # EMA teacher: deep copy of the student, frozen
@@ -285,7 +284,7 @@ class SDFTTrainer(Trainer):
     def _build_student_context(self, query):
         """Build student input: chat template with query only."""
         messages = [{"role": "user", "content": query}]
-        out = self.tokenizer.apply_chat_template(
+        out = self.processing_class.apply_chat_template(
             messages, return_tensors="pt", add_generation_prompt=True
         )
         if isinstance(out, torch.Tensor):
@@ -298,7 +297,7 @@ class SDFTTrainer(Trainer):
             query=query, demonstration=demonstration
         )
         messages = [{"role": "user", "content": teacher_content}]
-        out = self.tokenizer.apply_chat_template(
+        out = self.processing_class.apply_chat_template(
             messages, return_tensors="pt", add_generation_prompt=True
         )
         if isinstance(out, torch.Tensor):
@@ -332,7 +331,7 @@ class SDFTTrainer(Trainer):
                     max_new_tokens=self.max_gen_length,
                     do_sample=True,
                     temperature=self.gen_temperature,
-                    pad_token_id=self.tokenizer.pad_token_id,
+                    pad_token_id=self.processing_class.pad_token_id,
                 )
                 if self.gen_top_p is not None:
                     gen_kwargs["top_p"] = self.gen_top_p
@@ -624,7 +623,7 @@ def train(config):
         ))
 
     trainer = SDFTTrainer(
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         sdft_config=sdft_cfg,
         model=model,
         args=training_args,

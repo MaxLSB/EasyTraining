@@ -4,8 +4,14 @@ Same algorithm as sdft.py but uses vLLM in colocate mode for ~5-10x faster
 on-policy generation. The vLLM engine shares GPU memory with the training model
 via sleep mode: vLLM yields memory during forward/backward, reclaims it for generation.
 
+Key improvements over naive torch.generate:
+- vLLM continuous batching + PagedAttention for fast generation
+- Batched student/teacher forward passes (padded, not one-by-one)
+- Importance sampling correction for off-policy weight drift
+- Flash Attention 2 for training forward passes
+
 Requires: pip install vllm
-Launch: torchrun --nproc_per_node=N src/selfdistillation/sdft_vllm.py --config configs/sdft_config.yaml
+Launch: torchrun --nproc_per_node=N src/selfdistillation/sdft_vllm.py --config configs/sdft_vllm_config.yaml
 """
 
 import os
@@ -252,15 +258,18 @@ def init_vllm_engine(config):
 
     model_name = config["model"]["name"]
     vllm_cfg = config.get("vllm", {})
+    train_cfg = config.get("training", {})
 
     llm = LLM(
         model=model_name,
         tensor_parallel_size=vllm_cfg.get("tensor_parallel_size", 1),
         gpu_memory_utilization=vllm_cfg.get("gpu_memory_utilization", 0.3),
-        dtype="bfloat16" if config.get("training", {}).get("bf16") else "auto",
+        dtype="bfloat16" if train_cfg.get("bf16") else "auto",
         trust_remote_code=True,
         distributed_executor_backend="external_launcher",
         enable_sleep_mode=vllm_cfg.get("enable_sleep_mode", True),
+        max_model_len=vllm_cfg.get("max_model_len"),
+        enforce_eager=vllm_cfg.get("enforce_eager", False),
     )
     logger.info("[vllm] Engine initialized (gpu_mem=%.0f%%)",
                 vllm_cfg.get("gpu_memory_utilization", 0.3) * 100)
@@ -268,17 +277,63 @@ def init_vllm_engine(config):
 
 
 def sync_vllm_weights(llm, model):
-    """Copy training model weights into vLLM engine."""
-    from vllm.worker.model_runner import ModelRunner
+    """Copy training model weights into vLLM engine.
 
+    Handles both regular models and PEFT (LoRA) models by merging adapters
+    before syncing.
+    """
     unwrapped = model
     while hasattr(unwrapped, "module"):
         unwrapped = unwrapped.module
 
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    src_state = unwrapped.state_dict()
-    llm_model.load_weights(src_state.items())
-    logger.info("[vllm] Weights synced from training model")
+    # For PEFT models, we need to merge LoRA weights and get the full state dict
+    is_peft = hasattr(unwrapped, "peft_config")
+    if is_peft:
+        unwrapped.merge_adapter()
+
+    try:
+        llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+        src_state = unwrapped.state_dict()
+
+        # Filter out LoRA-specific keys if present — vLLM expects base model keys
+        if is_peft:
+            base_keys = {k for k in src_state if "lora_" not in k and "base_layer" not in k}
+            # Remove the "base_model.model." prefix that PEFT adds
+            cleaned = {}
+            for k, v in src_state.items():
+                if k in base_keys:
+                    clean_key = k.replace("base_model.model.", "")
+                    cleaned[clean_key] = v
+            llm_model.load_weights(cleaned.items())
+        else:
+            llm_model.load_weights(src_state.items())
+    finally:
+        if is_peft:
+            unwrapped.unmerge_adapter()
+
+    logger.info("[vllm] Weights synced from training model (peft=%s)", is_peft)
+
+
+# ── Batched Forward Utilities ────────────────────────────────────────────────
+
+
+def _pad_and_batch(sequences, pad_token_id, device):
+    """Left-pad a list of 1-D token tensors into a batch.
+
+    Returns (input_ids, attention_mask) both of shape (B, max_len).
+    Left-padding keeps generation positions aligned at the right side,
+    which makes extracting logits at the correct positions straightforward.
+    """
+    max_len = max(s.shape[0] for s in sequences)
+    input_ids = torch.full((len(sequences), max_len), pad_token_id, dtype=torch.long, device=device)
+    attention_mask = torch.zeros(len(sequences), max_len, dtype=torch.long, device=device)
+
+    for i, seq in enumerate(sequences):
+        offset = max_len - seq.shape[0]
+        input_ids[i, offset:] = seq
+        attention_mask[i, offset:] = 1
+
+    return input_ids, attention_mask
 
 
 # ── SDFT Trainer (vLLM) ─────────────────────────────────────────────────────
@@ -289,6 +344,11 @@ class SDFTVLLMTrainer(Trainer):
 
     Uses vLLM in colocate mode with sleep: during generation vLLM wakes up and
     uses GPU memory, during forward/backward it sleeps and yields memory back.
+
+    Key optimizations over vanilla SDFT:
+    - vLLM continuous batching for fast generation
+    - Batched student/teacher forward passes (left-padded)
+    - Optional importance sampling correction for off-policy weight drift
     """
 
     def __init__(self, tokenizer, sdft_config, vllm_engine, **kwargs):
@@ -316,8 +376,13 @@ class SDFTVLLMTrainer(Trainer):
             "Now answer with a response of your own, including the thinking process:\n"
         ))
 
+        # vLLM weight sync tracking
         self._steps_since_sync = 0
         self._sync_interval = sdft_config.get("vllm_sync_interval", 1)
+
+        # Importance sampling correction (accounts for vLLM weights being stale)
+        self._use_importance_sampling = sdft_config.get("importance_sampling", False)
+        self._is_cap = sdft_config.get("importance_sampling_cap", 2.0)
 
     @staticmethod
     def _unwrap_model(model):
@@ -349,7 +414,7 @@ class SDFTVLLMTrainer(Trainer):
         return out["input_ids"][0]
 
     def _build_student_prompts_text(self, queries):
-        """Build tokenized student prompts as text for vLLM."""
+        """Build student prompts as text for vLLM."""
         prompts = []
         for query in queries:
             messages = [{"role": "user", "content": query}]
@@ -360,7 +425,14 @@ class SDFTVLLMTrainer(Trainer):
         return prompts
 
     def _generate_student_rollouts_vllm(self, queries, device):
-        """Generate responses using vLLM engine (much faster than model.generate)."""
+        """Generate responses using vLLM engine (much faster than model.generate).
+
+        Returns:
+            all_prompt_ids: list of 1-D tensors (prompt token ids per query)
+            all_gen_ids: list of 1-D tensors (generated token ids per query)
+            all_gen_logprobs: list of 1-D tensors (per-token log-probs under vLLM policy)
+                             or None if importance sampling is disabled
+        """
         from vllm import SamplingParams
 
         # Sync weights to vLLM if needed
@@ -368,7 +440,7 @@ class SDFTVLLMTrainer(Trainer):
             sync_vllm_weights(self.vllm_engine, self.model)
             self._steps_since_sync = 0
 
-        # Wake up vLLM engine
+        # Wake up vLLM engine (reclaims GPU memory)
         self.vllm_engine.wake_up()
 
         sampling_params = SamplingParams(
@@ -376,40 +448,79 @@ class SDFTVLLMTrainer(Trainer):
             temperature=self.gen_temperature,
             top_p=self.gen_top_p if self.gen_top_p is not None else 1.0,
             top_k=self.gen_top_k if self.gen_top_k is not None else -1,
+            logprobs=1 if self._use_importance_sampling else None,
         )
 
         prompts = self._build_student_prompts_text(queries)
 
         t0 = time.time()
-        logger.info("[vllm-gen] Generating for %d queries (max_tokens=%d)", len(queries), self.max_gen_length)
+        logger.info("[vllm-gen] Generating for %d queries (max_tokens=%d)",
+                     len(queries), self.max_gen_length)
 
-        outputs = self.vllm_engine.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
+        outputs = self.vllm_engine.generate(
+            prompts, sampling_params=sampling_params, use_tqdm=False
+        )
 
         # Put vLLM to sleep to free GPU memory for training
         self.vllm_engine.sleep()
 
         all_prompt_ids = []
         all_gen_ids = []
+        all_gen_logprobs = [] if self._use_importance_sampling else None
 
         for qi, output in enumerate(outputs):
             prompt_ids = self._build_student_context(queries[qi]).to(device)
             gen_token_ids = output.outputs[0].token_ids
             gen_ids = torch.tensor(gen_token_ids, dtype=torch.long, device=device)
 
-            elapsed = time.time() - t0
-            logger.info("[vllm-gen] Query %d/%d: generated %d tokens (%.1f tok/s total)",
-                        qi + 1, len(queries), gen_ids.shape[0],
-                        sum(len(o.outputs[0].token_ids) for o in outputs) / max(elapsed, 0.01))
-
             all_prompt_ids.append(prompt_ids)
             all_gen_ids.append(gen_ids)
 
+            # Extract per-token log-probs from vLLM for importance sampling
+            if self._use_importance_sampling:
+                lps = []
+                for tok_logprob in output.outputs[0].logprobs:
+                    # Each element is a dict {token_id: Logprob}; get the sampled token's logprob
+                    sampled_id = gen_token_ids[len(lps)]
+                    lp = tok_logprob[sampled_id].logprob if sampled_id in tok_logprob else 0.0
+                    lps.append(lp)
+                all_gen_logprobs.append(torch.tensor(lps, dtype=torch.float32, device=device))
+
         elapsed = time.time() - t0
-        total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+        total_tokens = sum(ids.shape[0] for ids in all_gen_ids)
         logger.info("[vllm-gen] Done: %d tokens in %.1fs (%.1f tok/s)",
                     total_tokens, elapsed, total_tokens / max(elapsed, 0.01))
 
-        return all_prompt_ids, all_gen_ids
+        return all_prompt_ids, all_gen_ids, all_gen_logprobs
+
+    def _batched_forward(self, model, full_sequences, device, no_grad=False):
+        """Run a batched forward pass over variable-length sequences.
+
+        Args:
+            model: the model to run
+            full_sequences: list of 1-D tensors (each = prompt + gen tokens)
+            device: target device
+            no_grad: whether to disable gradients
+
+        Returns:
+            logits_list: list of full logits tensors, one per sequence (unpadded)
+        """
+        input_ids, attention_mask = _pad_and_batch(
+            full_sequences, self.tokenizer.pad_token_id, device
+        )
+
+        ctx = torch.no_grad() if no_grad else torch.enable_grad()
+        with ctx:
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+        # Un-pad: extract logits corresponding to the actual (non-pad) positions
+        logits_list = []
+        for i, seq in enumerate(full_sequences):
+            seq_len = seq.shape[0]
+            offset = input_ids.shape[1] - seq_len  # left-pad offset
+            logits_list.append(outputs.logits[i, offset:offset + seq_len])
+
+        return logits_list
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         device = next(model.parameters()).device
@@ -417,64 +528,102 @@ class SDFTVLLMTrainer(Trainer):
         demonstrations = inputs["demonstration"]
         logger.info("[loss] compute_loss called, batch_size=%d", len(queries))
 
-        # Step 1: Generate y ~ π_θ(·|x) using vLLM
+        # ── Step 1: Generate y ~ π_θ(·|x) using vLLM ────────────────────
         t0 = time.time()
-        student_prompt_ids, gen_ids_list = self._generate_student_rollouts_vllm(queries, device)
-        logger.info("[loss] Generation done in %.1fs", time.time() - t0)
+        student_prompt_ids, gen_ids_list, vllm_logprobs = (
+            self._generate_student_rollouts_vllm(queries, device)
+        )
+        logger.info("[loss] vLLM generation done in %.1fs", time.time() - t0)
 
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        total_tokens = 0
+        # ── Step 2: Build full sequences for batched forward ─────────────
+        student_sequences = []
+        teacher_sequences = []
+        valid_indices = []
+        student_prompt_lens = []
+        teacher_prompt_lens = []
 
         for i in range(len(queries)):
             gen_ids = gen_ids_list[i]
             if gen_ids.numel() == 0:
                 continue
 
-            # Step 2: Build student input = student_context + generated tokens
+            valid_indices.append(i)
             s_prompt = student_prompt_ids[i]
-            student_input_ids = torch.cat([s_prompt, gen_ids], dim=0).unsqueeze(0)
-
-            # Step 3: Build teacher input = teacher_context + generated tokens
             t_prompt = self._build_teacher_context(queries[i], demonstrations[i]).to(device)
-            teacher_input_ids = torch.cat([t_prompt, gen_ids], dim=0).unsqueeze(0)
 
-            # Create attention masks
-            student_attn = torch.ones_like(student_input_ids)
-            teacher_attn = torch.ones_like(teacher_input_ids)
+            student_sequences.append(torch.cat([s_prompt, gen_ids], dim=0))
+            teacher_sequences.append(torch.cat([t_prompt, gen_ids], dim=0))
+            student_prompt_lens.append(s_prompt.shape[0])
+            teacher_prompt_lens.append(t_prompt.shape[0])
 
-            # Step 4: Student forward pass (with grad)
-            student_outputs = model(input_ids=student_input_ids, attention_mask=student_attn)
-            s_start = s_prompt.shape[0] - 1
-            s_end = s_start + gen_ids.shape[0]
-            student_logits = student_outputs.logits[0, s_start:s_end]
+        if not valid_indices:
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+            return (loss, {"loss": loss.detach()}) if return_outputs else loss
 
-            # Step 5: Teacher forward pass (no grad, EMA model)
-            with torch.no_grad():
-                teacher_outputs = self.ema_model(input_ids=teacher_input_ids, attention_mask=teacher_attn)
-                t_start = t_prompt.shape[0] - 1
-                t_end = t_start + gen_ids.shape[0]
-                teacher_logits = teacher_outputs.logits[0, t_start:t_end]
+        # ── Step 3: Batched student forward (with grad) ──────────────────
+        t0 = time.time()
+        student_logits_list = self._batched_forward(
+            model, student_sequences, device, no_grad=False
+        )
+        logger.info("[loss] Student forward done in %.1fs", time.time() - t0)
 
-            # Step 6: KL divergence — reverse KL: KL(π_θ || π_φ)
+        # ── Step 4: Batched teacher forward (no grad, EMA) ───────────────
+        t0 = time.time()
+        teacher_logits_list = self._batched_forward(
+            self.ema_model, teacher_sequences, device, no_grad=True
+        )
+        logger.info("[loss] Teacher forward done in %.1fs", time.time() - t0)
+
+        # ── Step 5: Compute KL loss per sample ───────────────────────────
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        total_tokens = 0
+
+        for j, i in enumerate(valid_indices):
+            gen_ids = gen_ids_list[i]
+            gen_len = gen_ids.shape[0]
+
+            # Extract logits at generation positions
+            s_start = student_prompt_lens[j] - 1
+            student_logits = student_logits_list[j][s_start:s_start + gen_len]
+
+            t_start = teacher_prompt_lens[j] - 1
+            teacher_logits = teacher_logits_list[j][t_start:t_start + gen_len]
+
+            # Log-softmax for KL
             student_logprobs = F.log_softmax(student_logits, dim=-1)
             teacher_logprobs = F.log_softmax(teacher_logits, dim=-1)
 
-            gen_len = gen_ids.shape[0]
+            # Generation mask (optionally mask first N tokens)
             gen_mask = torch.ones(gen_len, device=device)
             if self.mask_first_n > 0:
                 mask_len = min(self.mask_first_n, gen_len)
                 gen_mask[:mask_len] = 0.0
 
+            # Per-token reverse KL: KL(π_student || π_teacher)
             per_token_kl = F.kl_div(
                 teacher_logprobs, student_logprobs, log_target=True, reduction="none"
-            ).sum(dim=-1)
+            ).sum(dim=-1)  # (gen_len,)
+
+            # Importance sampling correction: reweight by π_θ_current / π_θ_vllm
+            if self._use_importance_sampling and vllm_logprobs is not None:
+                # Current student log-prob of the generated tokens
+                current_logprobs = student_logprobs[
+                    torch.arange(gen_len, device=device), gen_ids
+                ]
+                vllm_lp = vllm_logprobs[i][:gen_len]
+
+                # IS ratio = exp(log π_current - log π_vllm), capped for stability
+                log_ratio = (current_logprobs - vllm_lp).detach()
+                is_ratio = log_ratio.exp().clamp(max=self._is_cap)
+
+                per_token_kl = per_token_kl * is_ratio
 
             masked_kl = per_token_kl * gen_mask
             n_tokens = gen_mask.sum().clamp(min=1)
             total_loss = total_loss + masked_kl.sum() / n_tokens
             total_tokens += n_tokens.item()
 
-        batch_size = len(queries)
+        batch_size = len(valid_indices)
         loss = total_loss / max(batch_size, 1)
         logger.info("[loss] KL loss=%.4f, total_tokens=%d", loss.item(), total_tokens)
 
@@ -540,7 +689,7 @@ class SDFTVLLMTrainer(Trainer):
 
 
 class EvalSampleLoggerCallback(TrainerCallback):
-    """Generate and log student model outputs on fixed eval queries at each eval step."""
+    """Generate and log student model outputs using vLLM at each eval step."""
 
     def __init__(self, tokenizer, eval_dataset, vllm_engine, num_samples=5, max_new_tokens=256, use_wandb=False):
         self.tokenizer = tokenizer
@@ -564,19 +713,25 @@ class EvalSampleLoggerCallback(TrainerCallback):
 
         from vllm import SamplingParams
 
+        # Sync current training weights to vLLM for eval
+        sync_vllm_weights(self.vllm_engine, model)
         self.vllm_engine.wake_up()
 
         prompts = []
         for sample in self.samples:
             messages = [{"role": "user", "content": sample["query"]}]
-            text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            text = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
             prompts.append(text)
 
         sampling_params = SamplingParams(
             max_tokens=self.max_new_tokens,
-            temperature=0.0,
+            temperature=0.0,  # greedy for eval
         )
-        outputs = self.vllm_engine.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
+        outputs = self.vllm_engine.generate(
+            prompts, sampling_params=sampling_params, use_tqdm=False
+        )
 
         self.vllm_engine.sleep()
 
@@ -648,7 +803,7 @@ def train(config):
 
     sdft_cfg = config.get("sdft", {})
 
-    # Initial weight sync
+    # Initial weight sync and put vLLM to sleep
     sync_vllm_weights(vllm_engine, model)
     vllm_engine.sleep()
 

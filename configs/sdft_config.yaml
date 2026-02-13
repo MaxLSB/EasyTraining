@@ -6,7 +6,7 @@ model:
 
 datasets:
   - name: lightonai/olmo_think_fr_sdft
-    split: train[:10%]
+    split: train
     # Map your dataset columns to the expected {query, demonstration} format.
     # Supported auto-detection: messages, conversations, instruction/output.
     column_map:
@@ -19,8 +19,8 @@ validation:
 
 training:
   output_dir: /opt/home/maxence/EasyTraining/training_results/sdft_test
-  per_device_train_batch_size: 1
-  gradient_accumulation_steps: 32      
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 16    
   num_train_epochs: 2                 
   learning_rate: 1e-5              
   warmup_steps: 60
@@ -29,7 +29,7 @@ training:
   logging_steps: 1
   save_strategy: epoch
   eval_strategy: steps
-  eval_steps: 50
+  eval_steps: 10
   report_to: wandb
   bf16: true
   optim: adamw_torch
@@ -38,7 +38,7 @@ training:
 
 sdft:
   ema_alpha: 0.01                       
-  max_gen_length: 1024 # 16384            
+  max_gen_length: 2048 # 16384            
   generation_temperature: 1.0           # paper default
   generation_top_p: null
   generation_top_k: null

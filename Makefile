@@ -1,39 +1,37 @@
-VENV := .venv
-PIP := $(VENV)/bin/pip
-PYTHON_VENV := $(VENV)/bin/python
+# ── Configuration ────────────────────────────────────────────────────
+VENV_STD  := .venv
+VENV_SDFT := .venv-sdft
+
 CUDA_HOME ?= /usr/local/cuda
 export CUDA_HOME
 
-# ── Environment ──────────────────────────────────────────────────────
-.PHONY: env
-env: $(VENV)/bin/activate  ## Create venv and install all dependencies
+# ── Environment Setup ────────────────────────────────────────────────
+.PHONY: env env-sdft
 
-$(VENV)/bin/activate:
+# 1. SFT + DPO
+env: $(VENV_STD)/bin/activate
+
+$(VENV_STD)/bin/activate:
 	@command -v uv >/dev/null 2>&1 || { echo "uv not found, installing..."; curl -LsSf https://astral.sh/uv/install.sh | sh; }
-	uv venv $(VENV) --python 3.11
-	uv pip install -e "."
-	@echo "\n✅ Environment ready. Activate with: source $(VENV)/bin/activate"
+	uv venv $(VENV_STD) --python 3.11
+	uv pip install -e ".[train]"
+	@echo "\n✅ Environment ready. Activate with: source $(VENV_STD)/bin/activate"
 
-# ── Training ─────────────────────────────────────────────────────────
-.PHONY: dpo sft sdft sdft-vllm
+# 2. Self-distillation
+env-sdft: $(VENV_SDFT)/bin/activate
 
-dpo:  ## Run DPO training (single GPU)
-	$(PYTHON_VENV) src/dpo/trl_dpo.py --config $(CONFIG)
+$(VENV_SDFT)/bin/activate:
+	@command -v uv >/dev/null 2>&1 || { echo "uv not found, installing..."; curl -LsSf https://astral.sh/uv/install.sh | sh; }
+	uv venv $(VENV_SDFT) --python 3.11
+	uv pip install --python $(VENV_SDFT) -e ".[sdft]"
+	@echo "\n✅ Environment ready. Activate with: source $(VENV_SDFT)/bin/activate"
 
-sft:  ## Run SFT training (single GPU)
-	$(PYTHON_VENV) src/sft/trl_sft.py --config $(CONFIG)
+# ── Utilities ────────────────────────────────────────────────────────
+.PHONY: clean help
 
-sdft:  ## Run SDFT training (single GPU)
-	$(PYTHON_VENV) src/selfdistillation/sdft.py --config $(CONFIG)
+clean:  ## Remove all venvs
+	rm -rf $(VENV_STD) $(VENV_SDFT)
 
-sdft-vllm:  ## Run SDFT training with vLLM generation
-	$(PYTHON_VENV) src/selfdistillation/sdft_vllm.py --config $(CONFIG)
-
-# ── Clean ────────────────────────────────────────────────────────────
-.PHONY: clean
-clean:  ## Remove venv
-	rm -rf $(VENV)
-
-.PHONY: help
 help:  ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+	awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'

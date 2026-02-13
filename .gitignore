@@ -1,9 +1,10 @@
 .python-version
 .venv/
+.venv-sdft/
 venv/
 env/
 venv/
-*.egg-info
+**.egg-info
 src/easytraining.egg-info
 .claude
 wandb/
