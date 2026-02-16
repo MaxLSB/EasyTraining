@@ -1,13 +1,14 @@
 import os
 import yaml
 import argparse
-import random
-import traceback
-
 import torch
 from datasets import load_dataset, concatenate_datasets, load_from_disk
 from pathlib import Path
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TrainerCallback
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+)
 from peft import LoraConfig, TaskType
 from trl import SFTTrainer, SFTConfig
 
@@ -18,11 +19,17 @@ def load_config(path):
 
 
 def is_chat_format(x):
-    return isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict) and "role" in x[0]
+    return (
+        isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict) and "role" in x[0]
+    )
 
 
 def get_torch_dtype(train_cfg):
-    if train_cfg.get("bf16") and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+    if (
+        train_cfg.get("bf16")
+        and torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported()
+    ):
         return torch.bfloat16
     if train_cfg.get("fp16"):
         return torch.float16
@@ -50,7 +57,11 @@ def format_dataset(ds, dcfg):
     """
     colmap = dcfg.get("column_map", {})
     for target, source in colmap.items():
-        if source != target and source in ds.column_names and target not in ds.column_names:
+        if (
+            source != target
+            and source in ds.column_names
+            and target not in ds.column_names
+        ):
             ds = ds.rename_column(source, target)
 
     if "messages" in ds.column_names:
@@ -62,6 +73,7 @@ def format_dataset(ds, dcfg):
 
     # Convert instruction/input/output -> messages
     if "instruction" in ds.column_names:
+
         def to_messages(ex):
             msgs = []
             if ex.get("system"):
@@ -70,8 +82,14 @@ def format_dataset(ds, dcfg):
             if ex.get("input"):
                 user_content += "\n" + ex["input"]
             msgs.append({"role": "user", "content": user_content})
-            msgs.append({"role": "assistant", "content": ex.get("output") or ex.get("response", "")})
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": ex.get("output") or ex.get("response", ""),
+                }
+            )
             return {"messages": msgs}
+
         return ds.map(to_messages, num_proc=8, remove_columns=ds.column_names)
 
     raise ValueError(
@@ -87,7 +105,11 @@ def load_datasets(config):
         subset = dcfg.get("subset")
 
         print(f"Loading dataset: {name} (split={split})")
-        ds = load_dataset(name, name=subset, split=split) if subset else load_split(name, split)
+        ds = (
+            load_dataset(name, name=subset, split=split)
+            if subset
+            else load_split(name, split)
+        )
 
         max_samples = dcfg.get("max_samples")
         if max_samples and max_samples > 0:
@@ -103,8 +125,14 @@ def load_datasets(config):
     split_ratio = val_cfg.get("split_ratio", 0.0)
     split_size = val_cfg.get("split_size")
     if split_ratio > 0 or split_size:
-        val_size = min(split_size, len(combined)) if split_size else int(len(combined) * split_ratio)
-        splits = combined.train_test_split(test_size=val_size, seed=val_cfg.get("seed", 42), shuffle=True)
+        val_size = (
+            min(split_size, len(combined))
+            if split_size
+            else int(len(combined) * split_ratio)
+        )
+        splits = combined.train_test_split(
+            test_size=val_size, seed=val_cfg.get("seed", 42), shuffle=True
+        )
         return splits["train"], splits["test"]
 
     return combined, None
@@ -126,14 +154,15 @@ def load_model(config):
     model_name = model_cfg["name"]
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    # FSDP: let SFTTrainer handle model loading and wrapping
-    fsdp = train_cfg.get("fsdp")
-    if fsdp and fsdp != "" and fsdp != []:
-        print(f"[Rank {local_rank}] FSDP: deferring model load to SFTTrainer")
-        return model_name
-
     torch_dtype = get_torch_dtype(train_cfg)
-    is_ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    is_fsdp = bool(train_cfg.get("fsdp"))
+
+    if model_cfg.get("load_in_4bit") and is_fsdp:
+        raise ValueError(
+            "4-bit quantization (BitsAndBytes) is incompatible with FSDP. "
+            "Use LoRA without quantization, or disable FSDP."
+        )
 
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -151,13 +180,14 @@ def load_model(config):
         load_kwargs["attn_implementation"] = model_cfg["attn_implementation"]
     if model_cfg.get("rope_scaling"):
         load_kwargs["rope_scaling"] = model_cfg["rope_scaling"]
-    if not is_ddp and torch.cuda.is_available():
+
+    # Single-GPU: place directly on device.
+    # DDP: no device_map, Trainer calls model.to(device) internally.
+    # FSDP: no device_map, FSDP handles sharding and device placement.
+    if not is_distributed and torch.cuda.is_available():
         load_kwargs["device_map"] = {"": local_rank}
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
-    if is_ddp and torch.cuda.is_available():
-        model.to(torch.device("cuda", local_rank))
-
     model.config.use_cache = False
     return model
 
@@ -172,10 +202,18 @@ def build_lora_config(config):
         lora_dropout=lora_cfg.get("dropout", 0.0),
         bias=lora_cfg.get("bias", "none"),
         task_type=TaskType.CAUSAL_LM,
-        target_modules=lora_cfg.get("target_modules", [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ]),
+        target_modules=lora_cfg.get(
+            "target_modules",
+            [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+        ),
         use_rslora=lora_cfg.get("use_rslora", False),
     )
 
@@ -186,18 +224,10 @@ def build_sft_config(config):
     use_bf16 = bool(train_cfg.get("bf16"))
     use_fp16 = bool(train_cfg.get("fp16"))
     if use_bf16 and not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()):
+        print("Warning: bf16 requested but not supported, falling back to fp16")
         use_bf16, use_fp16 = False, True
 
-    # FSDP model init kwargs
     fsdp = train_cfg.get("fsdp")
-    model_init_kwargs = None
-    if fsdp:
-        model_init_kwargs = {"trust_remote_code": True, "dtype": get_torch_dtype(train_cfg)}
-        model_cfg = config.get("model", {})
-        if model_cfg.get("attn_implementation"):
-            model_init_kwargs["attn_implementation"] = model_cfg["attn_implementation"]
-        if model_cfg.get("rope_scaling"):
-            model_init_kwargs["rope_scaling"] = model_cfg["rope_scaling"]
 
     # Default to use_reentrant=False for better LoRA + grad checkpoint compat
     gc_kwargs = train_cfg.get("gradient_checkpointing_kwargs")
@@ -232,7 +262,6 @@ def build_sft_config(config):
         # FSDP
         fsdp=fsdp or "",
         fsdp_config=train_cfg.get("fsdp_config", {}),
-        model_init_kwargs=model_init_kwargs,
         # SFT
         max_length=train_cfg.get("max_seq_length", train_cfg.get("max_length", 4096)),
         packing=train_cfg.get("packing", False),
@@ -240,112 +269,6 @@ def build_sft_config(config):
         dataset_text_field=train_cfg.get("dataset_text_field"),
         neftune_noise_alpha=train_cfg.get("neftune_noise_alpha"),
     )
-
-
-# ── Eval Callback ────────────────────────────────────────────────────────────
-
-
-class EvalSampleLoggerCallback(TrainerCallback):
-    """Generate and log model outputs on fixed eval prompts at each eval step."""
-
-    def __init__(self, tokenizer, eval_dataset, num_samples=5, max_new_tokens=256, use_wandb=False):
-        self.tokenizer = tokenizer
-        self.max_new_tokens = max_new_tokens
-        self.use_wandb = use_wandb
-        n = min(num_samples, len(eval_dataset))
-        self.samples = [eval_dataset[i] for i in random.sample(range(len(eval_dataset)), n)]
-
-    def _extract_prompt_and_reference(self, sample):
-        if "messages" in sample:
-            msgs = sample["messages"]
-            # Everything up to the last assistant turn = prompt, last assistant = reference
-            prompt_msgs, reference = [], ""
-            for i, m in enumerate(msgs):
-                if m["role"] == "assistant" and i == len(msgs) - 1:
-                    reference = m["content"]
-                else:
-                    prompt_msgs.append(m)
-            out = self.tokenizer.apply_chat_template(
-                prompt_msgs, return_tensors="pt", add_generation_prompt=True
-            )
-            input_ids = out if isinstance(out, torch.Tensor) else out["input_ids"]
-            return input_ids, reference
-
-        # Text format: use first half as prompt
-        text = sample.get("text", "")
-        tokens = self.tokenizer(text, return_tensors="pt")["input_ids"]
-        mid = max(tokens.shape[-1] // 2, 1)
-        reference = self.tokenizer.decode(tokens[0][mid:], skip_special_tokens=True)
-        return tokens[:, :mid], reference
-
-    @staticmethod
-    def _unwrap(model):
-        while hasattr(model, "module"):
-            model = model.module
-        return model
-
-    def on_evaluate(self, args, state, control, model=None, **kwargs):
-        if model is None:
-            return
-
-        is_main = int(os.environ.get("RANK", 0)) == 0
-        unwrapped = self._unwrap(model)
-        unwrapped.eval()
-
-        had_gc = getattr(unwrapped, "gradient_checkpointing", False)
-        if had_gc:
-            unwrapped.gradient_checkpointing_disable()
-        unwrapped.config.use_cache = True
-
-        device = next(unwrapped.parameters()).device
-
-        rows = []
-        for sample in self.samples:
-            try:
-                input_ids, reference = self._extract_prompt_and_reference(sample)
-                input_ids = input_ids.to(device) if isinstance(input_ids, torch.Tensor) else input_ids
-                prompt_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)[:500]
-
-                attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
-                with torch.no_grad():
-                    out = unwrapped.generate(
-                        input_ids, attention_mask=attention_mask,
-                        max_new_tokens=self.max_new_tokens,
-                        do_sample=False, pad_token_id=self.tokenizer.pad_token_id,
-                        temperature=None, top_p=None, top_k=None,
-                    )
-                generated = self.tokenizer.decode(out[0][input_ids.shape[-1]:], skip_special_tokens=True)[:500]
-            except Exception as e:
-                traceback.print_exc()
-                prompt_text = str(sample)[:200]
-                reference = ""
-                generated = f"[generation failed: {e}]"
-
-            row = {"prompt": prompt_text[:500], "reference": reference[:500], "generated": generated}
-            rows.append(row)
-
-            if is_main:
-                print(f"\n{'='*80}")
-                print(f"[Eval sample - step {state.global_step}]")
-                for k in ("prompt", "reference", "generated"):
-                    print(f"{k.upper():10s} {row[k][:300]}")
-                print("=" * 80)
-
-        unwrapped.config.use_cache = False
-        if had_gc:
-            unwrapped.gradient_checkpointing_enable()
-
-        if is_main and self.use_wandb:
-            try:
-                import wandb
-                if wandb.run:
-                    table = wandb.Table(
-                        columns=["prompt", "reference", "generated"],
-                        data=[[r[c] for c in ("prompt", "reference", "generated")] for r in rows],
-                    )
-                    wandb.log({"eval_samples": table, "global_step": state.global_step})
-            except Exception:
-                pass
 
 
 # ── Training ─────────────────────────────────────────────────────────────────
@@ -356,6 +279,7 @@ def setup_wandb(config):
     if not wandb_cfg.get("enabled") or int(os.environ.get("RANK", 0)) != 0:
         return
     import wandb
+
     wandb.init(
         project=wandb_cfg.get("project", "sft-training"),
         entity=wandb_cfg.get("entity"),
@@ -376,17 +300,6 @@ def train(config):
     sft_args = build_sft_config(config)
     peft_config = build_lora_config(config)
 
-    callbacks = []
-    eval_samples_cfg = config.get("eval_samples", {})
-    if eval_ds and eval_samples_cfg.get("enabled", True):
-        callbacks.append(EvalSampleLoggerCallback(
-            tokenizer=tokenizer,
-            eval_dataset=eval_ds,
-            num_samples=eval_samples_cfg.get("num_samples", 5),
-            max_new_tokens=eval_samples_cfg.get("max_new_tokens", 256),
-            use_wandb=config.get("wandb", {}).get("enabled", False),
-        ))
-
     trainer = SFTTrainer(
         model=model,
         args=sft_args,
@@ -394,7 +307,6 @@ def train(config):
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         peft_config=peft_config,
-        callbacks=callbacks or None,
     )
 
     resume_from = config.get("training", {}).get("resume_from_checkpoint")

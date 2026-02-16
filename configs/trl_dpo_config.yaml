@@ -6,8 +6,8 @@ model:
   attn_implementation: flash_attention_2
 
 datasets:
-  - name: lightonai/DPO_Native_Reasoning_FR_EN_chat_template
-    split: train[:5%]
+  - name: lightonai/OPSD-DPO-dataset-olmo
+    split: train
     column_map:
       prompt: prompt
       chosen: chosen
@@ -18,35 +18,35 @@ validation:
   seed: 42  
 
 training:
-  output_dir: /opt/home/maxence/EasyTraining/training_results/dpo_test
+  output_dir: /home/maxence_lasbordes/EasyTraining/training_results/dpo_test
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
   num_train_epochs: 1
-  learning_rate: 1e-5
+  learning_rate: 1e-6
   warmup_steps: 50
   lr_scheduler_type: linear
   weight_decay: 0.01
   logging_steps: 1
   save_strategy: epoch
   eval_strategy: steps
-  eval_steps: 10
+  eval_steps: 50
   report_to: wandb
   bf16: true
   fp16: false
   optim: adamw_torch
   max_grad_norm: 1.0
-  gradient_checkpointing: true  # use activation_checkpointing instead with FSDP
-  # fsdp: full_shard auto_wrap
-  # fsdp_config:
-  #   fsdp_version: 2
-  #   activation_checkpointing: true
+  # gradient_checkpointing: true  # use activation_checkpointing instead with FSDP
+  fsdp: full_shard auto_wrap
+  fsdp_config:
+    fsdp_version: 2
+    activation_checkpointing: true
 
 dpo:
   beta: 0.1
   loss_type: sigmoid
-  max_length: 4096
-  # max_prompt_length: 4096
+  max_length: 16384
+  max_prompt_length: 4096
   precompute_ref_log_probs: true  # REQUIRED with FSDP2
   dataset_num_proc: 8
 
@@ -63,11 +63,6 @@ dpo:
 #     - gate_proj
 #     - up_proj
 #     - down_proj
-
-eval_samples:
-  enabled: true
-  num_samples: 3
-  max_new_tokens: 256
 
 wandb:
   enabled: true
