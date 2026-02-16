@@ -1,5 +1,5 @@
 # ── Configuration ────────────────────────────────────────────────────
-VENV_STD  := .venv
+VENV  := .venv
 VENV_SDFT := .venv-sdft
 
 CUDA_HOME ?= /usr/local/cuda
@@ -9,13 +9,13 @@ export CUDA_HOME
 .PHONY: env env-sdft
 
 # 1. SFT + DPO
-env: $(VENV_STD)/bin/activate
+env: $(VENV)/bin/activate
 
-$(VENV_STD)/bin/activate:
+$(VENV)/bin/activate:
 	@command -v uv >/dev/null 2>&1 || { echo "uv not found, installing..."; curl -LsSf https://astral.sh/uv/install.sh | sh; }
-	uv venv $(VENV_STD) --python 3.11
-	uv pip install -e ".[train]"
-	@echo "\n✅ Environment ready. Activate with: source $(VENV_STD)/bin/activate"
+	uv venv $(VENV) --python 3.11
+	uv pip install --python $(VENV) -e ".[train]"
+	@echo "\n✅ Environment ready. Activate with: source $(VENV)/bin/activate"
 
 # 2. Self-distillation
 env-sdft: $(VENV_SDFT)/bin/activate
@@ -30,7 +30,7 @@ $(VENV_SDFT)/bin/activate:
 .PHONY: clean help
 
 clean:  ## Remove all venvs
-	rm -rf $(VENV_STD) $(VENV_SDFT)
+	rm -rf $(VENV) $(VENV_SDFT)
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
