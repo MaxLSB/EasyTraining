@@ -5,7 +5,7 @@ from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
 from tqdm.asyncio import tqdm
 from openai import AsyncOpenAI
-
+from langdetect import detect
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate DPO dataset from reasoning traces.")
@@ -15,7 +15,7 @@ def parse_args():
     parser.add_argument("--max_tokens", type=int, default=16384)
     parser.add_argument("--max_model_len", type=int, default=20000)
     parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--concurrency", type=int, default=256, help="Max concurrent requests to vLLM")
+    parser.add_argument("--concurrency", type=int, default=512, help="Max concurrent requests to vLLM")
     parser.add_argument("--base_url", type=str, default="http://localhost:8000/v1")
     return parser.parse_args()
 
@@ -45,42 +45,43 @@ def prepare_tasks(dataset, tokenizer, max_input_tokens):
         query = prompt_msgs[-1]["content"]
         demo_content = (
             f"{query}\n\n"
-            f"This is an example for a response to the question:\n"
+            f"Voici un exemple de réponse à la question :\n"
             f"{clean_answer}\n\n"
-            f"Now answer with a response of your own, including the thinking process:\n"
+            f"Maintenant, réponds avec ta propre réponse, en incluant le processus de réflexion en français.\n"
         )
         demo_msgs = prompt_msgs[:-1] + [{"role": "user", "content": demo_content}]
 
-        full_prompt = tokenizer.apply_chat_template(
+        # Demo prompt (with example answer) for chosen generation
+        demo_prompt = tokenizer.apply_chat_template(
             demo_msgs, tokenize=False, add_generation_prompt=True,
         )
+        demo_think_start = demo_prompt if template_adds_think else demo_prompt + "<think>\n"
 
-        if template_adds_think:
-            prompt_no_think = re.sub(r"<think>\n?$", "", full_prompt).rstrip() + "\n"
-        else:
-            prompt_no_think = full_prompt
-
-        think_start = full_prompt if template_adds_think else full_prompt + "<think>\n"
+        # Raw prompt (no example) for rejected generation
+        raw_prompt = tokenizer.apply_chat_template(
+            prompt_msgs, tokenize=False, add_generation_prompt=True,
+        )
 
         if lang != "fr":
             continue
 
-        # Drop samples where the prompt exceeds input token budget
-        token_count = len(tokenizer.encode(think_start + "D'accord,"))
+        # Drop samples where the longer prompt (demo) exceeds input token budget
+        token_count = len(tokenizer.encode(demo_think_start + "D'accord,"))
         if token_count > max_input_tokens:
             continue
 
-        # chosen: thinks in French (forced with D'accord,)
+        # chosen: conditioned on prompt + example answer, forced French reasoning
         tasks.append({
-            "id": row_id, "prompt": demo_msgs, "lang": lang, "type": "chosen",
-            "prompt_text": think_start + "D'accord,",
+            "id": row_id, "prompt": prompt_msgs, "lang": lang, "type": "chosen",
+            "prompt_text": demo_think_start + "D'accord,",
             "prefix": "<think>\nD'accord,",
         })
-        # rejected: thinks freely (likely English)
+        # rejected: just the prompt, model thinks freely (likely English)
+        raw_think_start = raw_prompt if template_adds_think else raw_prompt + "<think>\n"
         tasks.append({
-            "id": row_id, "prompt": demo_msgs, "lang": lang, "type": "rejected",
-            "prompt_text": full_prompt,
-            "prefix": "<think>\n" if template_adds_think else "",
+            "id": row_id, "prompt": prompt_msgs, "lang": lang, "type": "rejected",
+            "prompt_text": raw_think_start,
+            "prefix": "<think>\n",
         })
 
     return tasks
@@ -108,13 +109,12 @@ async def generate_all(client, prompts, tasks, args):
                 text = ""
             outputs[idx] = text
             done += 1
-            if done % 200 == 0:
+            if done % 500 == 0:
                 task = tasks[idx]
-                content = task["prefix"] + text
                 print(f"\n{'='*80}")
                 print(f"  [{done}/{len(prompts)}] id={task['id']} type={task['type']}")
                 print(f"{'='*80}")
-                print(f"{prompt}{content}")
+                print(f"{prompt}{text}")
                 print(f"{'='*80}\n")
 
     await tqdm.gather(*[generate_one(i, p) for i, p in enumerate(prompts)], desc="Generating")
@@ -125,6 +125,9 @@ async def amain():
     args = parse_args()
 
     ds = load_dataset(args.dataset_id, split="train")
+    total_before = len(ds)
+    ds = ds.filter(lambda x: x["language"] != "en")
+    print(f"Filtered out English samples: {total_before} -> {len(ds)}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
 
     max_input_tokens = args.max_model_len - args.max_tokens
@@ -147,12 +150,50 @@ async def amain():
                 "prompt": task["prompt"], "chosen": None, "rejected": None,
             }
         content = task["prefix"] + generated
-        conversation = task["prompt"] + [{"role": "assistant", "content": content}]
-        processed[rid][task["type"]] = conversation
+        processed[rid][task["type"]] = [{"role": "assistant", "content": content}]
 
-    new_dataset = Dataset.from_list(list(processed.values()))
+    # Filter samples: keep only where chosen=French and rejected=English reasoning
+    def extract_thinking(text):
+        match = re.search(r'<think>(.*?)</think>', text, flags=re.DOTALL)
+        return match.group(1).strip() if match else text.strip()
+
+    def detect_lang(text):
+        try:
+            return detect(text) if text else "unknown"
+        except Exception:
+            return "unknown"
+
+    def has_valid_think_block(text):
+        return bool(re.search(r'<think>\n.+?\n</think>', text, flags=re.DOTALL))
+
+    filtered = []
+    total = 0
+    malformed = 0
+    for row in processed.values():
+        if row["chosen"] is None or row["rejected"] is None:
+            continue
+        total += 1
+        chosen_content = row["chosen"][-1]["content"]
+        rejected_content = row["rejected"][-1]["content"]
+        if not has_valid_think_block(chosen_content) or not has_valid_think_block(rejected_content):
+            malformed += 1
+            continue
+        chosen_thinking = extract_thinking(chosen_content)
+        rejected_thinking = extract_thinking(rejected_content)
+        chosen_lang = detect_lang(chosen_thinking)
+        rejected_lang = detect_lang(rejected_thinking)
+        if chosen_lang == "fr" and rejected_lang == "en":
+            filtered.append(row)
+
+    print(f"\n{'='*60}")
+    print(f"Malformed <think> blocks: {malformed}/{total} samples discarded")
+    print(f"Language filtering: kept {len(filtered)}/{total - malformed} valid samples")
+    print(f"  (chosen=French AND rejected=English)")
+    print(f"{'='*60}\n")
+
+    new_dataset = Dataset.from_list(filtered)
     print(f"Pushing to Hub: {args.output_repo}")
-    new_dataset.push_to_hub(args.output_repo)
+    new_dataset.push_to_hub(args.output_repo, private=True)
     print("Done!")
 
 

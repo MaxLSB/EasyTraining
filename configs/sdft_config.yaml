@@ -1,48 +1,27 @@
-# SDFT (Self-Distillation Fine-Tuning) config
-
+# ── Model Configuration ───────────────────────────────────────────────────────
 model:
-  name: Qwen/Qwen3-4B-Thinking-2507
-  attn_implementation: flash_attention_2
+  name: "Qwen/Qwen3-4B-Thinking-2507"
+  attn_implementation: "flash_attention_2"
 
+# ── Dataset Configuration ─────────────────────────────────────────────────────
 datasets:
-  - name: lightonai/olmo_think_fr_sdft
-    split: train
-    # Map your dataset columns to the expected {query, demonstration} format.
-    # Supported auto-detection: messages, conversations, instruction/output.
+  - name: "lightonai/olmo_think_fr_sdft"
+    split: "train[:10%]"
     column_map:
-      query: query
-      demonstration: demonstration_no_think
+      query: "query"
+      demonstration: "demonstration_no_think"
 
 validation:
   split_ratio: 0.01
   seed: 42
 
-training:
-  output_dir: /opt/home/maxence/EasyTraining/training_results/sdft_test
-  per_device_train_batch_size: 4
-  gradient_accumulation_steps: 1    
-  num_train_epochs: 1                 
-  learning_rate: 1e-5              
-  warmup_steps: 10
-  lr_scheduler_type: cosine        
-  weight_decay: 0.0
-  logging_steps: 1
-  save_strategy: epoch
-  eval_strategy: steps
-  eval_steps: 5
-  report_to: wandb
-  bf16: true
-  optim: adamw_torch
-  max_grad_norm: 1.0
-  gradient_checkpointing: true
-
+# ── SDFT Algorithm Parameters ─────────────────────────────────────────────────
 sdft:
-  ema_alpha: 0.01                       
-  max_gen_length: 2048 # 16384            
-  generation_temperature: 1.0           # paper default
-  generation_top_p: null
-  generation_top_k: null
-  mask_first_n_tokens: 0
+  ema_alpha: 0.01
+  max_gen_length: 1024 # maximum number of tokens the student model generates
+  generation_temperature: 1.0
+
+  # Template used to prime the teacher model (French)
   teacher_prompt_template: |
     {query}
 
@@ -51,26 +30,50 @@ sdft:
 
     Now answer with a response of your own, including the thinking process. You must reason in French inside <think></think>.
 
-# lora:
-#   enabled: true
-#   r: 32
-#   alpha: 64
-#   dropout: 0.05
-#   target_modules:
-#     - q_proj
-#     - k_proj
-#     - v_proj
-#     - o_proj
-#     - gate_proj
-#     - up_proj
-#     - down_proj
+# ── vLLM Engine Configuration ─────────────────────────────────────────────────
+vllm:
+  gpu_memory_utilization: 0.35
+  data_parallel_size: 2
+  max_model_len: 2048
 
-eval_samples:
-  enabled: true
-  num_samples: 3
-  max_new_tokens: 256
+# ── Training Arguments (HuggingFace) ──────────────────────────────────────────
+training:
+  output_dir: "/opt/home/maxence/EasyTraining/training_results/sdft_test"
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 32
+  learning_rate: 1.0e-5
+  lr_scheduler_type: "cosine"
+  warmup_steps: 60
+  num_train_epochs: 2
+  optim: "adamw_torch"
+  bf16: true
+  logging_steps: 1
+  save_strategy: "epoch"
+  eval_strategy: "steps"
+  eval_steps: 50
+  report_to: "wandb"
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
 
+# ── LoRA / PEFT Configuration ─────────────────────────────────────────────────
+lora:
+  enabled: false
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  bias: "none"
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# ── Logging & Callbacks ───────────────────────────────────────────────────────
 wandb:
   enabled: true
-  project: EasyTraining
-  run_name: sdft_test
+  project: "EasyTraining"
+  run_name: "sdft_test"

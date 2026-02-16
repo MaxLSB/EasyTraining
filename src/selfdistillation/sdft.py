@@ -1,31 +1,34 @@
+"""Self-Distillation Fine-Tuning (SDFT) with vLLM-accelerated generation.
+
+Uses vLLM in colocate mode for fast on-policy generation. The vLLM engine
+shares GPU memory with the training model via sleep mode.
+
+Launch: torchrun --nproc_per_node=N src/selfdistillation/sdft.py --config configs/sdft_config.yaml
+"""
+
 import os
 import sys
 import yaml
 import argparse
-import random
-import traceback
 import copy
 import time
 import logging
 
-# logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger("sdft")
 
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
 from datasets import load_dataset, concatenate_datasets, load_from_disk
 from pathlib import Path
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     BitsAndBytesConfig,
-    TrainerCallback,
     Trainer,
     TrainingArguments,
 )
 from peft import LoraConfig, TaskType
-from torch.utils.data.distributed import DistributedSampler   # ← NEW
 
 
 def load_config(path):
@@ -33,19 +36,16 @@ def load_config(path):
         return yaml.safe_load(f)
 
 
-def is_chat_format(x):
-    return isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict) and "role" in x[0]
-
-
 def get_torch_dtype(train_cfg):
-    if train_cfg.get("bf16") and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+    if (
+        train_cfg.get("bf16")
+        and torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported()
+    ):
         return torch.bfloat16
     if train_cfg.get("fp16"):
         return torch.float16
     return torch.float32
-
-
-# ── Data ─────────────────────────────────────────────────────────────────────
 
 
 def load_split(path, split):
@@ -61,7 +61,11 @@ def format_dataset(ds, dcfg):
     """Normalize dataset to {query, demonstration} columns."""
     colmap = dcfg.get("column_map", {})
     for target, source in colmap.items():
-        if source != target and source in ds.column_names and target not in ds.column_names:
+        if (
+            source != target
+            and source in ds.column_names
+            and target not in ds.column_names
+        ):
             ds = ds.rename_column(source, target)
 
     if "query" in ds.column_names and "demonstration" in ds.column_names:
@@ -86,6 +90,7 @@ def format_dataset(ds, dcfg):
         return ds.map(from_messages, num_proc=8, remove_columns=ds.column_names)
 
     if "instruction" in ds.column_names:
+
         def from_instruction(ex):
             query = ex["instruction"]
             if ex.get("input"):
@@ -108,7 +113,11 @@ def load_datasets(config):
         subset = dcfg.get("subset")
 
         print(f"Loading dataset: {name} (split={split})")
-        ds = load_dataset(name, name=subset, split=split) if subset else load_split(name, split)
+        ds = (
+            load_dataset(name, name=subset, split=split)
+            if subset
+            else load_split(name, split)
+        )
 
         max_samples = dcfg.get("max_samples")
         if max_samples and max_samples > 0:
@@ -124,14 +133,17 @@ def load_datasets(config):
     split_ratio = val_cfg.get("split_ratio", 0.0)
     split_size = val_cfg.get("split_size")
     if split_ratio > 0 or split_size:
-        val_size = min(split_size, len(combined)) if split_size else int(len(combined) * split_ratio)
-        splits = combined.train_test_split(test_size=val_size, seed=val_cfg.get("seed", 42), shuffle=True)
+        val_size = (
+            min(split_size, len(combined))
+            if split_size
+            else int(len(combined) * split_ratio)
+        )
+        splits = combined.train_test_split(
+            test_size=val_size, seed=val_cfg.get("seed", 42), shuffle=True
+        )
         return splits["train"], splits["test"]
 
     return combined, None
-
-
-# ── Model & Config ───────────────────────────────────────────────────────────
 
 
 def load_tokenizer(config):
@@ -142,13 +154,13 @@ def load_tokenizer(config):
 
 
 def load_model(config):
-    """Fixed: always loads directly onto the correct GPU (single-GPU + DDP)."""
     model_cfg = config["model"]
     train_cfg = config.get("training", {})
     model_name = model_cfg["name"]
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     torch_dtype = get_torch_dtype(train_cfg)
+    is_ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
 
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -166,12 +178,13 @@ def load_model(config):
         load_kwargs["attn_implementation"] = model_cfg["attn_implementation"]
     if model_cfg.get("rope_scaling"):
         load_kwargs["rope_scaling"] = model_cfg["rope_scaling"]
-
-    # Always use device_map → works perfectly with DDP
-    if torch.cuda.is_available():
+    if not is_ddp and torch.cuda.is_available():
         load_kwargs["device_map"] = {"": local_rank}
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    if is_ddp and torch.cuda.is_available():
+        model.to(torch.device("cuda", local_rank))
+
     model.config.use_cache = False
     return model
 
@@ -186,10 +199,18 @@ def build_lora_config(config):
         lora_dropout=lora_cfg.get("dropout", 0.0),
         bias=lora_cfg.get("bias", "none"),
         task_type=TaskType.CAUSAL_LM,
-        target_modules=lora_cfg.get("target_modules", [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ]),
+        target_modules=lora_cfg.get(
+            "target_modules",
+            [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+        ),
         use_rslora=lora_cfg.get("use_rslora", False),
     )
 
@@ -234,17 +255,93 @@ def build_training_args(config):
     )
 
 
-# ── SDFT Trainer ─────────────────────────────────────────────────────────────
+def init_vllm_engine(config):
+    """Initialize vLLM LLM engine in colocate mode with sleep support."""
+    from vllm import LLM
+
+    model_name = config["model"]["name"]
+    vllm_cfg = config.get("vllm", {})
+    train_cfg = config.get("training", {})
+
+    llm = LLM(
+        model=model_name,
+        tensor_parallel_size=vllm_cfg.get("tensor_parallel_size", 1),
+        data_parallel_size=vllm_cfg.get("data_parallel_size", 1),
+        gpu_memory_utilization=vllm_cfg.get("gpu_memory_utilization", 0.3),
+        dtype="bfloat16" if train_cfg.get("bf16") else "auto",
+        trust_remote_code=True,
+        distributed_executor_backend="external_launcher",
+        enable_sleep_mode=vllm_cfg.get("enable_sleep_mode", True),
+        max_model_len=vllm_cfg.get("max_model_len"),
+        enforce_eager=vllm_cfg.get("enforce_eager", False),
+    )
+    logger.info(
+        "[vllm] Engine initialized (gpu_mem=%.0f%%)",
+        vllm_cfg.get("gpu_memory_utilization", 0.3) * 100,
+    )
+    return llm
+
+
+def sync_vllm_weights(llm, model):
+    """Copy training model weights into vLLM engine."""
+    unwrapped = model
+    while hasattr(unwrapped, "module"):
+        unwrapped = unwrapped.module
+
+    is_peft = hasattr(unwrapped, "peft_config")
+    if is_peft:
+        unwrapped.merge_adapter()
+
+    try:
+        llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+        src_state = unwrapped.state_dict()
+
+        if is_peft:
+            base_keys = {
+                k for k in src_state if "lora_" not in k and "base_layer" not in k
+            }
+            cleaned = {}
+            for k, v in src_state.items():
+                if k in base_keys:
+                    clean_key = k.replace("base_model.model.", "")
+                    cleaned[clean_key] = v
+            llm_model.load_weights(cleaned.items())
+        else:
+            llm_model.load_weights(src_state.items())
+    finally:
+        if is_peft:
+            unwrapped.unmerge_adapter()
+
+    logger.info("[vllm] Weights synced from training model (peft=%s)", is_peft)
+
+
+def _pad_and_batch(sequences, pad_token_id, device):
+    """Left-pad a list of 1-D token tensors into a batch."""
+    max_len = max(s.shape[0] for s in sequences)
+    input_ids = torch.full(
+        (len(sequences), max_len), pad_token_id, dtype=torch.long, device=device
+    )
+    attention_mask = torch.zeros(
+        len(sequences), max_len, dtype=torch.long, device=device
+    )
+
+    for i, seq in enumerate(sequences):
+        offset = max_len - seq.shape[0]
+        input_ids[i, offset:] = seq
+        attention_mask[i, offset:] = 1
+
+    return input_ids, attention_mask
 
 
 class SDFTTrainer(Trainer):
-    """Self-Distillation Fine-Tuning trainer."""
+    """SDFT trainer with vLLM-accelerated generation."""
 
-    def __init__(self, processing_class, sdft_config, **kwargs):
-        super().__init__(processing_class=processing_class, **kwargs)
+    def __init__(self, tokenizer, sdft_config, vllm_engine, **kwargs):
+        super().__init__(**kwargs)
+        self.tokenizer = tokenizer
         self.sdft_config = sdft_config
+        self.vllm_engine = vllm_engine
 
-        # EMA teacher: deep copy of the student, frozen
         unwrapped = self._unwrap_model(self.model)
         self.ema_model = copy.deepcopy(unwrapped)
         self.ema_model.requires_grad_(False)
@@ -256,12 +353,21 @@ class SDFTTrainer(Trainer):
         self.gen_top_p = sdft_config.get("generation_top_p")
         self.gen_top_k = sdft_config.get("generation_top_k")
         self.mask_first_n = sdft_config.get("mask_first_n_tokens", 0)
-        self.teacher_prompt_template = sdft_config.get("teacher_prompt_template", (
-            "{query}\n\n"
-            "This is an example for a response to the question:\n"
-            "{demonstration}\n\n"
-            "Now answer with a response of your own, including the thinking process:\n"
-        ))
+        self.teacher_prompt_template = sdft_config.get(
+            "teacher_prompt_template",
+            (
+                "{query}\n\n"
+                "This is an example for a response to the question:\n"
+                "{demonstration}\n\n"
+                "Now answer with a response of your own, including the thinking process:\n"
+            ),
+        )
+
+        self._steps_since_sync = 0
+        self._sync_interval = sdft_config.get("vllm_sync_interval", 1)
+
+        self._use_importance_sampling = sdft_config.get("importance_sampling", False)
+        self._is_cap = sdft_config.get("importance_sampling_cap", 2.0)
 
     @staticmethod
     def _unwrap_model(model):
@@ -269,21 +375,9 @@ class SDFTTrainer(Trainer):
             model = model.module
         return model
 
-    def _get_distributed_sampler(self, dataset, shuffle=True):
-        """Return DistributedSampler only when running in DDP (torchrun)."""
-        if not dist.is_available() or not dist.is_initialized():
-            return None
-        return DistributedSampler(
-            dataset,
-            num_replicas=dist.get_world_size(),
-            rank=dist.get_rank(),
-            shuffle=shuffle,
-            seed=getattr(self.args, "seed", 42),
-        )
-
     def _build_student_context(self, query):
         messages = [{"role": "user", "content": query}]
-        out = self.processing_class.apply_chat_template(
+        out = self.tokenizer.apply_chat_template(
             messages, return_tensors="pt", add_generation_prompt=True
         )
         if isinstance(out, torch.Tensor):
@@ -295,57 +389,108 @@ class SDFTTrainer(Trainer):
             query=query, demonstration=demonstration
         )
         messages = [{"role": "user", "content": teacher_content}]
-        out = self.processing_class.apply_chat_template(
+        out = self.tokenizer.apply_chat_template(
             messages, return_tensors="pt", add_generation_prompt=True
         )
         if isinstance(out, torch.Tensor):
             return out[0]
         return out["input_ids"][0]
 
+    def _build_student_prompts_text(self, queries):
+        prompts = []
+        for query in queries:
+            messages = [{"role": "user", "content": query}]
+            text = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            prompts.append(text)
+        return prompts
+
     def _generate_student_rollouts(self, queries, device):
-        unwrapped = self._unwrap_model(self.model)
-        unwrapped.eval()
-        unwrapped.config.use_cache = True
-        logger.info("[gen] Starting rollouts for %d queries (max_new_tokens=%d)", len(queries), self.max_gen_length)
+        from vllm import SamplingParams
+
+        if self._steps_since_sync >= self._sync_interval:
+            sync_vllm_weights(self.vllm_engine, self.model)
+            self._steps_since_sync = 0
+
+        self.vllm_engine.wake_up()
+
+        sampling_params = SamplingParams(
+            max_tokens=self.max_gen_length,
+            temperature=self.gen_temperature,
+            top_p=self.gen_top_p if self.gen_top_p is not None else 1.0,
+            top_k=self.gen_top_k if self.gen_top_k is not None else -1,
+            logprobs=1 if self._use_importance_sampling else None,
+        )
+
+        prompts = self._build_student_prompts_text(queries)
+
+        t0 = time.time()
+        logger.info(
+            "[vllm-gen] Generating for %d queries (max_tokens=%d)",
+            len(queries),
+            self.max_gen_length,
+        )
+
+        outputs = self.vllm_engine.generate(
+            prompts, sampling_params=sampling_params, use_tqdm=False
+        )
+
+        self.vllm_engine.sleep()
 
         all_prompt_ids = []
         all_gen_ids = []
+        all_gen_logprobs = [] if self._use_importance_sampling else None
 
-        with torch.no_grad():
-            for qi, query in enumerate(queries):
-                prompt_ids = self._build_student_context(query).to(device)
-                input_ids = prompt_ids.unsqueeze(0)
-                attention_mask = torch.ones_like(input_ids)
+        for qi, output in enumerate(outputs):
+            prompt_ids = self._build_student_context(queries[qi]).to(device)
+            gen_token_ids = output.outputs[0].token_ids
+            gen_ids = torch.tensor(gen_token_ids, dtype=torch.long, device=device)
 
-                gen_kwargs = dict(
-                    max_new_tokens=self.max_gen_length,
-                    do_sample=True,
-                    temperature=self.gen_temperature,
-                    pad_token_id=self.processing_class.pad_token_id,
+            all_prompt_ids.append(prompt_ids)
+            all_gen_ids.append(gen_ids)
+
+            if self._use_importance_sampling:
+                lps = []
+                for tok_logprob in output.outputs[0].logprobs:
+                    sampled_id = gen_token_ids[len(lps)]
+                    lp = (
+                        tok_logprob[sampled_id].logprob
+                        if sampled_id in tok_logprob
+                        else 0.0
+                    )
+                    lps.append(lp)
+                all_gen_logprobs.append(
+                    torch.tensor(lps, dtype=torch.float32, device=device)
                 )
-                if self.gen_top_p is not None:
-                    gen_kwargs["top_p"] = self.gen_top_p
-                if self.gen_top_k is not None:
-                    gen_kwargs["top_k"] = self.gen_top_k
 
-                t0 = time.time()
-                logger.info("[gen] Query %d/%d: prompt_len=%d, generating...", qi + 1, len(queries), prompt_ids.shape[0])
-                output = unwrapped.generate(
-                    input_ids, attention_mask=attention_mask, **gen_kwargs
-                )
-                gen_ids = output[0][prompt_ids.shape[0]:]
-                elapsed = time.time() - t0
-                logger.info("[gen] Query %d/%d: generated %d tokens in %.1fs (%.1f tok/s)",
-                            qi + 1, len(queries), gen_ids.shape[0], elapsed,
-                            gen_ids.shape[0] / max(elapsed, 0.01))
-                all_prompt_ids.append(prompt_ids)
-                all_gen_ids.append(gen_ids)
+        elapsed = time.time() - t0
+        total_tokens = sum(ids.shape[0] for ids in all_gen_ids)
+        logger.info(
+            "[vllm-gen] Done: %d tokens in %.1fs (%.1f tok/s)",
+            total_tokens,
+            elapsed,
+            total_tokens / max(elapsed, 0.01),
+        )
 
-        unwrapped.config.use_cache = False
-        unwrapped.train()
-        logger.info("[gen] Rollouts complete")
+        return all_prompt_ids, all_gen_ids, all_gen_logprobs
 
-        return all_prompt_ids, all_gen_ids
+    def _batched_forward(self, model, full_sequences, device, no_grad=False):
+        input_ids, attention_mask = _pad_and_batch(
+            full_sequences, self.tokenizer.pad_token_id, device
+        )
+
+        ctx = torch.no_grad() if no_grad else torch.enable_grad()
+        with ctx:
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+        logits_list = []
+        for i, seq in enumerate(full_sequences):
+            seq_len = seq.shape[0]
+            offset = input_ids.shape[1] - seq_len  # left-pad offset
+            logits_list.append(outputs.logits[i, offset : offset + seq_len])
+
+        return logits_list
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         device = next(model.parameters()).device
@@ -354,77 +499,116 @@ class SDFTTrainer(Trainer):
         logger.info("[loss] compute_loss called, batch_size=%d", len(queries))
 
         t0 = time.time()
-        student_prompt_ids, gen_ids_list = self._generate_student_rollouts(queries, device)
+        student_prompt_ids, gen_ids_list, vllm_logprobs = (
+            self._generate_student_rollouts(queries, device)
+        )
         logger.info("[loss] Generation done in %.1fs", time.time() - t0)
 
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        total_tokens = 0
+        student_sequences = []
+        teacher_sequences = []
+        valid_indices = []
+        student_prompt_lens = []
+        teacher_prompt_lens = []
 
         for i in range(len(queries)):
             gen_ids = gen_ids_list[i]
             if gen_ids.numel() == 0:
                 continue
 
+            valid_indices.append(i)
             s_prompt = student_prompt_ids[i]
-            student_input_ids = torch.cat([s_prompt, gen_ids], dim=0).unsqueeze(0)
+            t_prompt = self._build_teacher_context(queries[i], demonstrations[i]).to(
+                device
+            )
 
-            t_prompt = self._build_teacher_context(queries[i], demonstrations[i]).to(device)
-            teacher_input_ids = torch.cat([t_prompt, gen_ids], dim=0).unsqueeze(0)
+            student_sequences.append(torch.cat([s_prompt, gen_ids], dim=0))
+            teacher_sequences.append(torch.cat([t_prompt, gen_ids], dim=0))
+            student_prompt_lens.append(s_prompt.shape[0])
+            teacher_prompt_lens.append(t_prompt.shape[0])
 
-            student_attn = torch.ones_like(student_input_ids)
-            teacher_attn = torch.ones_like(teacher_input_ids)
+        if not valid_indices:
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+            return (loss, {"loss": loss.detach()}) if return_outputs else loss
 
-            student_outputs = model(input_ids=student_input_ids, attention_mask=student_attn)
-            s_start = s_prompt.shape[0] - 1
-            s_end = s_start + gen_ids.shape[0]
-            student_logits = student_outputs.logits[0, s_start:s_end]
+        t0 = time.time()
+        student_logits_list = self._batched_forward(
+            model, student_sequences, device, no_grad=False
+        )
+        logger.info("[loss] Student forward done in %.1fs", time.time() - t0)
 
-            with torch.no_grad():
-                teacher_outputs = self.ema_model(input_ids=teacher_input_ids, attention_mask=teacher_attn)
-                t_start = t_prompt.shape[0] - 1
-                t_end = t_start + gen_ids.shape[0]
-                teacher_logits = teacher_outputs.logits[0, t_start:t_end]
+        t0 = time.time()
+        teacher_logits_list = self._batched_forward(
+            self.ema_model, teacher_sequences, device, no_grad=True
+        )
+        logger.info("[loss] Teacher forward done in %.1fs", time.time() - t0)
+
+        # On-policy reverse KL loss: loss_t = ℓS_t · stop_grad(ℓS_t − ℓT_t)
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        total_tokens = 0
+
+        for j, i in enumerate(valid_indices):
+            gen_ids = gen_ids_list[i]
+            gen_len = gen_ids.shape[0]
+
+            s_start = student_prompt_lens[j] - 1
+            student_logits = student_logits_list[j][s_start : s_start + gen_len]
+
+            t_start = teacher_prompt_lens[j] - 1
+            teacher_logits = teacher_logits_list[j][t_start : t_start + gen_len]
 
             student_logprobs = F.log_softmax(student_logits, dim=-1)
             teacher_logprobs = F.log_softmax(teacher_logits, dim=-1)
 
-            gen_len = gen_ids.shape[0]
+            token_indices = torch.arange(gen_len, device=device)
+            student_token_lp = student_logprobs[token_indices, gen_ids]
+            teacher_token_lp = teacher_logprobs[token_indices, gen_ids]
+
             gen_mask = torch.ones(gen_len, device=device)
             if self.mask_first_n > 0:
                 mask_len = min(self.mask_first_n, gen_len)
                 gen_mask[:mask_len] = 0.0
 
-            per_token_kl = F.kl_div(
-                teacher_logprobs, student_logprobs, log_target=True, reduction="none"
-            ).sum(dim=-1)
+            advantage = (student_token_lp - teacher_token_lp).detach()
+            per_token_loss = student_token_lp * advantage
 
-            masked_kl = per_token_kl * gen_mask
+            if self._use_importance_sampling and vllm_logprobs is not None:
+                vllm_lp = vllm_logprobs[i][:gen_len]
+                log_ratio = (student_token_lp - vllm_lp).detach()
+                is_ratio = log_ratio.exp().clamp(max=self._is_cap)
+                per_token_loss = per_token_loss * is_ratio
+
+            masked_loss = per_token_loss * gen_mask
             n_tokens = gen_mask.sum().clamp(min=1)
-            total_loss = total_loss + masked_kl.sum() / n_tokens
+            total_loss = total_loss + masked_loss.sum() / n_tokens
             total_tokens += n_tokens.item()
 
-        batch_size = len(queries)
+        batch_size = len(valid_indices)
         loss = total_loss / max(batch_size, 1)
-        logger.info("[loss] KL loss=%.4f, total_tokens=%d", loss.item(), total_tokens)
+        logger.info("[loss] SDFT loss=%.4f, total_tokens=%d", loss.item(), total_tokens)
 
         if return_outputs:
             return loss, {"loss": loss.detach()}
         return loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        loss = super().training_step(
+            model, inputs, num_items_in_batch=num_items_in_batch
+        )
         self._update_ema()
+        self._steps_since_sync += 1
         return loss
 
     def _update_ema(self):
+        """EMA update: φ ← (1-α)·φ + α·θ"""
         unwrapped = self._unwrap_model(self.model)
         alpha = self.ema_alpha
         with torch.no_grad():
-            for ema_param, student_param in zip(self.ema_model.parameters(), unwrapped.parameters()):
+            for ema_param, student_param in zip(
+                self.ema_model.parameters(), unwrapped.parameters()
+            ):
                 ema_param.data.mul_(1.0 - alpha).add_(student_param.data, alpha=alpha)
 
     def get_train_dataloader(self):
-        """Fixed: now uses DistributedSampler when running with torchrun."""
         from torch.utils.data import DataLoader
 
         def collate_fn(batch):
@@ -433,20 +617,16 @@ class SDFTTrainer(Trainer):
                 "demonstration": [b["demonstration"] for b in batch],
             }
 
-        sampler = self._get_distributed_sampler(self.train_dataset, shuffle=True)
-
         return DataLoader(
             self.train_dataset,
             batch_size=self.args.per_device_train_batch_size,
-            sampler=sampler,
-            shuffle=sampler is None,
+            shuffle=True,
             collate_fn=collate_fn,
             num_workers=0,
             drop_last=True,
         )
 
     def get_eval_dataloader(self, eval_dataset=None):
-        """Fixed: same for evaluation."""
         from torch.utils.data import DataLoader
 
         ds = eval_dataset if eval_dataset is not None else self.eval_dataset
@@ -457,108 +637,13 @@ class SDFTTrainer(Trainer):
                 "demonstration": [b["demonstration"] for b in batch],
             }
 
-        sampler = self._get_distributed_sampler(ds, shuffle=False)
-
         return DataLoader(
             ds,
             batch_size=self.args.per_device_eval_batch_size,
-            sampler=sampler,
             shuffle=False,
             collate_fn=collate_fn,
             num_workers=0,
         )
-
-
-# ── Eval Callback ────────────────────────────────────────────────────────────
-
-
-class EvalSampleLoggerCallback(TrainerCallback):
-    """Generate and log student model outputs on fixed eval queries at each eval step."""
-
-    def __init__(self, tokenizer, eval_dataset, num_samples=5, max_new_tokens=256, use_wandb=False):
-        self.tokenizer = tokenizer
-        self.max_new_tokens = max_new_tokens
-        self.use_wandb = use_wandb
-        n = min(num_samples, len(eval_dataset))
-        self.samples = [eval_dataset[i] for i in random.sample(range(len(eval_dataset)), n)]
-
-    def _prompt_to_ids(self, query):
-        messages = [{"role": "user", "content": query}]
-        out = self.tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
-        if isinstance(out, torch.Tensor):
-            return out
-        return out["input_ids"]
-
-    @staticmethod
-    def _unwrap(model):
-        while hasattr(model, "module"):
-            model = model.module
-        return model
-
-    def on_evaluate(self, args, state, control, model=None, **kwargs):
-        if model is None:
-            return
-
-        is_main = int(os.environ.get("RANK", 0)) == 0
-        unwrapped = self._unwrap(model)
-        unwrapped.eval()
-
-        had_gc = getattr(unwrapped, "gradient_checkpointing", False)
-        if had_gc:
-            unwrapped.gradient_checkpointing_disable()
-        unwrapped.config.use_cache = True
-
-        device = next(unwrapped.parameters()).device
-
-        rows = []
-        for sample in self.samples:
-            try:
-                input_ids = self._prompt_to_ids(sample["query"]).to(device)
-                attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
-                with torch.no_grad():
-                    out = unwrapped.generate(
-                        input_ids, attention_mask=attention_mask,
-                        max_new_tokens=self.max_new_tokens,
-                        do_sample=False, pad_token_id=self.tokenizer.pad_token_id,
-                        temperature=None, top_p=None, top_k=None,
-                    )
-                generated = self.tokenizer.decode(out[0][input_ids.shape[-1]:], skip_special_tokens=True)[:500]
-            except Exception as e:
-                traceback.print_exc()
-                generated = f"[generation failed: {e}]"
-
-            row = {
-                "query": sample["query"][:500],
-                "demonstration": sample["demonstration"][:500],
-                "generated": generated,
-            }
-            rows.append(row)
-
-            if is_main:
-                print(f"\n{'='*80}")
-                print(f"[Eval sample - step {state.global_step}]")
-                for k in ("query", "demonstration", "generated"):
-                    print(f"{k.upper():15s} {row[k][:300]}")
-                print("=" * 80)
-
-        unwrapped.config.use_cache = False
-        if had_gc:
-            unwrapped.gradient_checkpointing_enable()
-
-        if is_main and self.use_wandb:
-            try:
-                import wandb
-                if wandb.run:
-                    table = wandb.Table(
-                        columns=["query", "demonstration", "generated"],
-                        data=[[r[c] for c in ("query", "demonstration", "generated")] for r in rows],
-                    )
-                    wandb.log({"eval_samples": table, "global_step": state.global_step})
-            except Exception:
-                pass
-
-
-# ── Training ─────────────────────────────────────────────────────────────────
 
 
 def setup_wandb(config):
@@ -566,6 +651,7 @@ def setup_wandb(config):
     if not wandb_cfg.get("enabled") or int(os.environ.get("RANK", 0)) != 0:
         return
     import wandb
+
     wandb.init(
         project=wandb_cfg.get("project", "sdft-training"),
         entity=wandb_cfg.get("entity"),
@@ -582,36 +668,31 @@ def train(config):
     tokenizer = load_tokenizer(config)
     train_ds, eval_ds = load_datasets(config)
 
+    vllm_engine = init_vllm_engine(config)
+
     model = load_model(config)
     training_args = build_training_args(config)
     peft_config = build_lora_config(config)
 
     if peft_config is not None:
         from peft import get_peft_model
+
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
 
     sdft_cfg = config.get("sdft", {})
 
-    callbacks = []
-    eval_samples_cfg = config.get("eval_samples", {})
-    if eval_ds and eval_samples_cfg.get("enabled", True):
-        callbacks.append(EvalSampleLoggerCallback(
-            tokenizer=tokenizer,
-            eval_dataset=eval_ds,
-            num_samples=eval_samples_cfg.get("num_samples", 5),
-            max_new_tokens=eval_samples_cfg.get("max_new_tokens", 256),
-            use_wandb=config.get("wandb", {}).get("enabled", False),
-        ))
+    sync_vllm_weights(vllm_engine, model)
+    vllm_engine.sleep()
 
     trainer = SDFTTrainer(
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         sdft_config=sdft_cfg,
+        vllm_engine=vllm_engine,
         model=model,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        callbacks=callbacks or None,
     )
 
     resume_from = config.get("training", {}).get("resume_from_checkpoint")
