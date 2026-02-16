@@ -13,6 +13,7 @@ logger = logging.getLogger("sdft")
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from datasets import load_dataset, concatenate_datasets, load_from_disk
 from pathlib import Path
 from transformers import (
@@ -24,6 +25,7 @@ from transformers import (
     TrainingArguments,
 )
 from peft import LoraConfig, TaskType
+from torch.utils.data.distributed import DistributedSampler   # ← NEW
 
 
 def load_config(path):
@@ -56,13 +58,7 @@ def load_split(path, split):
 
 
 def format_dataset(ds, dcfg):
-    """Normalize dataset to {query, demonstration} columns.
-
-    Supported input formats:
-    - messages: last assistant message = demonstration, everything before = query
-    - instruction/output: instruction = query, output = demonstration
-    - Direct query/demonstration via column_map
-    """
+    """Normalize dataset to {query, demonstration} columns."""
     colmap = dcfg.get("column_map", {})
     for target, source in colmap.items():
         if source != target and source in ds.column_names and target not in ds.column_names:
@@ -76,7 +72,6 @@ def format_dataset(ds, dcfg):
 
         def from_messages(ex):
             msgs = ex[msg_col]
-            # Find the last assistant message as demonstration
             query_parts, demonstration = [], ""
             for i, m in enumerate(msgs):
                 if m["role"] == "assistant" and i == len(msgs) - 1:
@@ -147,13 +142,13 @@ def load_tokenizer(config):
 
 
 def load_model(config):
+    """Fixed: always loads directly onto the correct GPU (single-GPU + DDP)."""
     model_cfg = config["model"]
     train_cfg = config.get("training", {})
     model_name = model_cfg["name"]
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     torch_dtype = get_torch_dtype(train_cfg)
-    is_ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
 
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -171,13 +166,12 @@ def load_model(config):
         load_kwargs["attn_implementation"] = model_cfg["attn_implementation"]
     if model_cfg.get("rope_scaling"):
         load_kwargs["rope_scaling"] = model_cfg["rope_scaling"]
-    if not is_ddp and torch.cuda.is_available():
+
+    # Always use device_map → works perfectly with DDP
+    if torch.cuda.is_available():
         load_kwargs["device_map"] = {"": local_rank}
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
-    if is_ddp and torch.cuda.is_available():
-        model.to(torch.device("cuda", local_rank))
-
     model.config.use_cache = False
     return model
 
@@ -244,13 +238,7 @@ def build_training_args(config):
 
 
 class SDFTTrainer(Trainer):
-    """Self-Distillation Fine-Tuning trainer.
-
-    The student generates responses from queries only, while the teacher (EMA of
-    student) is conditioned on both query + expert demonstration. Training
-    minimizes reverse KL divergence between student and teacher distributions
-    along the student's own generated trajectories.
-    """
+    """Self-Distillation Fine-Tuning trainer."""
 
     def __init__(self, processing_class, sdft_config, **kwargs):
         super().__init__(processing_class=processing_class, **kwargs)
@@ -281,8 +269,19 @@ class SDFTTrainer(Trainer):
             model = model.module
         return model
 
+    def _get_distributed_sampler(self, dataset, shuffle=True):
+        """Return DistributedSampler only when running in DDP (torchrun)."""
+        if not dist.is_available() or not dist.is_initialized():
+            return None
+        return DistributedSampler(
+            dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            shuffle=shuffle,
+            seed=getattr(self.args, "seed", 42),
+        )
+
     def _build_student_context(self, query):
-        """Build student input: chat template with query only."""
         messages = [{"role": "user", "content": query}]
         out = self.processing_class.apply_chat_template(
             messages, return_tensors="pt", add_generation_prompt=True
@@ -292,7 +291,6 @@ class SDFTTrainer(Trainer):
         return out["input_ids"][0]
 
     def _build_teacher_context(self, query, demonstration):
-        """Build teacher input: chat template with query + demonstration in-context."""
         teacher_content = self.teacher_prompt_template.format(
             query=query, demonstration=demonstration
         )
@@ -305,15 +303,7 @@ class SDFTTrainer(Trainer):
         return out["input_ids"][0]
 
     def _generate_student_rollouts(self, queries, device):
-        """Generate responses from student model (no grad).
-
-        Switches model to eval mode so GradientCheckpointingLayer.__call__
-        skips the cache-blocking codepath (it checks `self.training`).
-        """
         unwrapped = self._unwrap_model(self.model)
-
-        # eval() makes GradientCheckpointingLayer skip the GC branch
-        # (the check is `if self.gradient_checkpointing and self.training`)
         unwrapped.eval()
         unwrapped.config.use_cache = True
         logger.info("[gen] Starting rollouts for %d queries (max_new_tokens=%d)", len(queries), self.max_gen_length)
@@ -351,7 +341,6 @@ class SDFTTrainer(Trainer):
                 all_prompt_ids.append(prompt_ids)
                 all_gen_ids.append(gen_ids)
 
-        # Restore training state
         unwrapped.config.use_cache = False
         unwrapped.train()
         logger.info("[gen] Rollouts complete")
@@ -364,7 +353,6 @@ class SDFTTrainer(Trainer):
         demonstrations = inputs["demonstration"]
         logger.info("[loss] compute_loss called, batch_size=%d", len(queries))
 
-        # Step 1: Generate y ~ π_θ(·|x) on-policy from the student
         t0 = time.time()
         student_prompt_ids, gen_ids_list = self._generate_student_rollouts(queries, device)
         logger.info("[loss] Generation done in %.1fs", time.time() - t0)
@@ -377,48 +365,38 @@ class SDFTTrainer(Trainer):
             if gen_ids.numel() == 0:
                 continue
 
-            # Step 2: Build student input = student_context + generated tokens
             s_prompt = student_prompt_ids[i]
             student_input_ids = torch.cat([s_prompt, gen_ids], dim=0).unsqueeze(0)
 
-            # Step 3: Build teacher input = teacher_context + generated tokens
             t_prompt = self._build_teacher_context(queries[i], demonstrations[i]).to(device)
             teacher_input_ids = torch.cat([t_prompt, gen_ids], dim=0).unsqueeze(0)
 
-            # Create attention masks
             student_attn = torch.ones_like(student_input_ids)
             teacher_attn = torch.ones_like(teacher_input_ids)
 
-            # Step 4: Student forward pass (with grad) — predict next token at generation positions
             student_outputs = model(input_ids=student_input_ids, attention_mask=student_attn)
-            # Logits at positions [s_prompt_len-1 .. s_prompt_len+gen_len-2] predict gen tokens
             s_start = s_prompt.shape[0] - 1
             s_end = s_start + gen_ids.shape[0]
-            student_logits = student_outputs.logits[0, s_start:s_end]  # (gen_len, vocab)
+            student_logits = student_outputs.logits[0, s_start:s_end]
 
-            # Step 5: Teacher forward pass (no grad, EMA model)
             with torch.no_grad():
                 teacher_outputs = self.ema_model(input_ids=teacher_input_ids, attention_mask=teacher_attn)
                 t_start = t_prompt.shape[0] - 1
                 t_end = t_start + gen_ids.shape[0]
-                teacher_logits = teacher_outputs.logits[0, t_start:t_end]  # (gen_len, vocab)
+                teacher_logits = teacher_outputs.logits[0, t_start:t_end]
 
-            # Step 6: KL divergence — reverse KL: KL(π_θ || π_φ)
             student_logprobs = F.log_softmax(student_logits, dim=-1)
             teacher_logprobs = F.log_softmax(teacher_logits, dim=-1)
 
-            # Build generation mask (optionally mask first N tokens)
             gen_len = gen_ids.shape[0]
             gen_mask = torch.ones(gen_len, device=device)
             if self.mask_first_n > 0:
                 mask_len = min(self.mask_first_n, gen_len)
                 gen_mask[:mask_len] = 0.0
 
-            # Per-token KL: sum over vocab dimension
-            # KL(P||Q) = sum_x P(x) * (log P(x) - log Q(x))
             per_token_kl = F.kl_div(
                 teacher_logprobs, student_logprobs, log_target=True, reduction="none"
-            ).sum(dim=-1)  # (gen_len,)
+            ).sum(dim=-1)
 
             masked_kl = per_token_kl * gen_mask
             n_tokens = gen_mask.sum().clamp(min=1)
@@ -439,7 +417,6 @@ class SDFTTrainer(Trainer):
         return loss
 
     def _update_ema(self):
-        """EMA update: φ ← (1-α)·φ + α·θ"""
         unwrapped = self._unwrap_model(self.model)
         alpha = self.ema_alpha
         with torch.no_grad():
@@ -447,7 +424,7 @@ class SDFTTrainer(Trainer):
                 ema_param.data.mul_(1.0 - alpha).add_(student_param.data, alpha=alpha)
 
     def get_train_dataloader(self):
-        """Override to use a simple dataloader that passes raw dicts."""
+        """Fixed: now uses DistributedSampler when running with torchrun."""
         from torch.utils.data import DataLoader
 
         def collate_fn(batch):
@@ -456,17 +433,20 @@ class SDFTTrainer(Trainer):
                 "demonstration": [b["demonstration"] for b in batch],
             }
 
+        sampler = self._get_distributed_sampler(self.train_dataset, shuffle=True)
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.args.per_device_train_batch_size,
-            shuffle=True,
+            sampler=sampler,
+            shuffle=sampler is None,
             collate_fn=collate_fn,
             num_workers=0,
             drop_last=True,
         )
 
     def get_eval_dataloader(self, eval_dataset=None):
-        """Override to use same collation for eval."""
+        """Fixed: same for evaluation."""
         from torch.utils.data import DataLoader
 
         ds = eval_dataset if eval_dataset is not None else self.eval_dataset
@@ -477,9 +457,12 @@ class SDFTTrainer(Trainer):
                 "demonstration": [b["demonstration"] for b in batch],
             }
 
+        sampler = self._get_distributed_sampler(ds, shuffle=False)
+
         return DataLoader(
             ds,
             batch_size=self.args.per_device_eval_batch_size,
+            sampler=sampler,
             shuffle=False,
             collate_fn=collate_fn,
             num_workers=0,
@@ -603,7 +586,6 @@ def train(config):
     training_args = build_training_args(config)
     peft_config = build_lora_config(config)
 
-    # Apply LoRA if configured
     if peft_config is not None:
         from peft import get_peft_model
         model = get_peft_model(model, peft_config)
