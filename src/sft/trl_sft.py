@@ -313,6 +313,8 @@ def train(config):
     trainer.train(resume_from_checkpoint=resume_from)
 
     outdir = config["training"].get("output_dir", "./outputs/sft")
+    if trainer.is_fsdp_enabled:
+        trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
     trainer.save_model(outdir)
     tokenizer.save_pretrained(outdir)
     print("SFT training complete.")

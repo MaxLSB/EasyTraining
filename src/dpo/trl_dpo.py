@@ -59,12 +59,14 @@ def ensure_preference_columns(ds, colmap):
     return ds
 
 
-def normalize_text(ds, num_proc=8):
-    def to_text(x):
-        if isinstance(x, str) or is_chat_format(x):
+def normalize_to_chat(ds, num_proc=8):
+    def to_chat(x, role):
+        if is_chat_format(x):
             return x
+        if isinstance(x, str):
+            return [{"role": role, "content": x}]
         if isinstance(x, list):
-            return "\n".join(
+            text = "\n".join(
                 (
                     f'{m.get("role","")}: {m.get("content","")}'
                     if isinstance(m, dict)
@@ -72,12 +74,17 @@ def normalize_text(ds, num_proc=8):
                 )
                 for m in x
             )
+            return [{"role": role, "content": text}]
         if isinstance(x, dict):
-            return x.get("content", str(x))
-        return str(x)
+            return [{"role": role, "content": x.get("content", str(x))}]
+        return [{"role": role, "content": str(x)}]
 
     def _map(ex):
-        return {k: to_text(ex.get(k, "")) for k in ("prompt", "chosen", "rejected")}
+        return {
+            "prompt": to_chat(ex.get("prompt", ""), "user"),
+            "chosen": to_chat(ex.get("chosen", ""), "assistant"),
+            "rejected": to_chat(ex.get("rejected", ""), "assistant"),
+        }
 
     return ds.map(_map, num_proc=num_proc)
 
@@ -104,7 +111,7 @@ def load_datasets(config):
             ds = ds.select(range(min(max_samples, len(ds))))
 
         ds = ensure_preference_columns(ds, colmap)
-        ds = normalize_text(ds)
+        ds = normalize_to_chat(ds)
         all_ds.append(ds)
         print(f"  -> {len(ds)} samples")
 
@@ -135,16 +142,8 @@ def filter_overlength(ds, tokenizer, max_length, num_proc=8):
         return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
     def fits(ex):
-        full_chosen = (
-            ex["prompt"] + ex["chosen"]
-            if is_chat_format(ex["prompt"])
-            else ex["prompt"] + ex["chosen"]
-        )
-        full_rejected = (
-            ex["prompt"] + ex["rejected"]
-            if is_chat_format(ex["prompt"])
-            else ex["prompt"] + ex["rejected"]
-        )
+        full_chosen = ex["prompt"] + ex["chosen"]
+        full_rejected = ex["prompt"] + ex["rejected"]
         return max(token_len(full_chosen), token_len(full_rejected)) <= max_length
 
     before = len(ds)
@@ -184,7 +183,7 @@ def load_model(config):
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
 
-    load_kwargs = dict(trust_remote_code=True, dtype=torch_dtype)
+    load_kwargs = dict(trust_remote_code=True, torch_dtype=torch_dtype)
 
     if model_cfg.get("load_in_4bit"):
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -198,13 +197,12 @@ def load_model(config):
     if model_cfg.get("rope_scaling"):
         load_kwargs["rope_scaling"] = model_cfg["rope_scaling"]
 
-    # Single-GPU: place directly on device.
-    # DDP: no device_map, Trainer calls model.to(device) internally.
-    # FSDP: no device_map, FSDP handles sharding and device placement.
     if not is_distributed and torch.cuda.is_available():
         load_kwargs["device_map"] = {"": local_rank}
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    if is_distributed and torch.cuda.is_available():
+        model.to(torch.device("cuda", local_rank))
     model.config.use_cache = False
     return model
 
@@ -333,6 +331,8 @@ def train(config):
     trainer.train(resume_from_checkpoint=resume_from)
 
     outdir = config["training"].get("output_dir", "./outputs/dpo")
+    if trainer.is_fsdp_enabled:
+        trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
     trainer.save_model(outdir)
     tokenizer.save_pretrained(outdir)
     print("DPO training complete.")
