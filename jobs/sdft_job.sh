@@ -9,7 +9,7 @@
 #SBATCH --error=/home/maxence_lasbordes/EasyTraining/logs/sdft_%j.err    # Error log
 
 PROJECT_DIR=/home/maxence_lasbordes/EasyTraining
-CONFIG="$PROJECT_DIR/configs/sdft_config.yaml"
+CONFIG="$PROJECT_DIR/configs/trl_sdft_config.yaml"
 
 echo "========================================"
 echo "Job ID: $SLURM_JOB_ID"
@@ -27,7 +27,7 @@ export PYTHONUNBUFFERED=1
 
 # --- Launch SDFT training (single GPU with vLLM sleep mode) ---
 echo "Starting SDFT training..."
-python "$PROJECT_DIR/src/selfdistillation/sdft.py" \
+python "$PROJECT_DIR/src/selfdistillation/trl_sdft.py" \
     --config "$CONFIG"
 EXIT_CODE=$?
 
