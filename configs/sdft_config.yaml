@@ -1,0 +1,86 @@
+# Self-Distillation Fine-Tuning (SDFT) config using DistilTrainer
+# Hyperparameters aligned with Shenfeld et al. (2025), arXiv:2601.19897
+
+model:
+  name: Qwen/Qwen3-4B-Thinking-2507
+  attn_implementation: flash_attention_2
+
+datasets:
+  - name: lightonai/olmo_think_fr_sdft
+    split: train
+    column_map:
+      prompt: query
+      completion: demonstration_no_think
+    # max_samples: 10000
+
+validation:
+  split_ratio: 0.01
+  seed: 42
+
+sdft:
+  # Teacher prompt template ({prompt} and {completion} are replaced per sample)
+  # teacher_template: |
+  #   {prompt}
+  #   This is an example for a response to the question:
+  #   {completion}
+  #   Now answer with a response of your own, including the thinking process:
+  # student_system_prompt: null
+  # teacher_system_prompt: null
+
+distil:
+  # ── Generation ─────────────────────────────────────────────────────
+  max_prompt_length: 1024
+  max_completion_length: 1024
+  num_generations: 1               # 1 on-policy completion per prompt
+  temperature: 1.0
+  top_p: 1.0
+  # top_k: null
+  # min_p: null
+  repetition_penalty: 1.0
+  generate_from_teacher: false     # student generates (on-policy)
+  steps_per_generation: 32         # generate once, train 32 sub-batches
+
+  # ── KL / Loss ──────────────────────────────────────────────────────
+  alpha: 1.0                       # 0=forward KL, 1=reverse KL, (0,1)=JSD
+  beta: 0.0                        # KL penalty to base model (0=disabled)
+  loss_type: dapo
+  num_loss_tokens_to_skip: 3       # mask first N completion tokens
+  disable_dropout: false
+  # mask_truncated_completions: false
+  # top_entropy_quantile: 1.0
+
+  # ── EMA teacher sync ───────────────────────────────────────────────
+  sync_ref_model: true
+  ref_model_mixup_alpha: 0.01     # EMA α: ϕ ← α·θ + (1−α)·ϕ
+  ref_model_sync_steps: 1         # sync every optimizer step
+
+  # ── vLLM (colocated on-policy generation) ──────────────────────────
+  use_vllm: true
+  vllm_mode: colocate
+  vllm_gpu_memory_utilization: 0.3
+  vllm_enable_sleep_mode: true
+
+  # ── Logging ────────────────────────────────────────────────────────
+  log_completions: false
+
+training:
+  output_dir: ./training_results/sdft_test
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 32
+  num_train_epochs: 1
+  learning_rate: 2e-5
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  weight_decay: 0.0
+  logging_steps: 1
+  save_strategy: steps
+  save_steps: 100
+  report_to: wandb
+  bf16: true
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+
+wandb:
+  enabled: true
+  project: EasyTraining
+  run_name: sdft_test
