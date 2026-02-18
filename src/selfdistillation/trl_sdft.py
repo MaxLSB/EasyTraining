@@ -7,6 +7,7 @@ import os
 # For single-GPU SDFT we keep the worker in-process so weight syncing is a
 # direct in-memory copy.
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
 
 import copy
 import yaml
@@ -109,6 +110,58 @@ def load_datasets(config):
         return splits["train"], splits["test"]
 
     return combined, None
+
+
+def filter_long_prompts(
+    dataset,
+    tokenizer,
+    max_prompt_length,
+    student_system_prompt=None,
+    teacher_system_prompt=None,
+):
+    """Remove samples where student or teacher formatted prompt exceeds max_prompt_length."""
+    initial_len = len(dataset)
+
+    def _tokenize_len(text):
+        return len(tokenizer.encode(text, add_special_tokens=False))
+
+    def _fits(example):
+        # Student prompt: chat-templated user prompt
+        s_messages = []
+        if student_system_prompt:
+            s_messages.append({"role": "system", "content": student_system_prompt})
+        s_messages.append({"role": "user", "content": example["prompt"]})
+        s_text = tokenizer.apply_chat_template(
+            s_messages, tokenize=False, add_generation_prompt=True
+        )
+
+        # Teacher prompt: prompt + demonstration + template
+        teacher_content = (
+            f"{example['prompt']}\n"
+            f"This is an example for a response to the question:\n"
+            f"{example['completion']}\n"
+            f"Now answer with a response of your own, including the thinking process:"
+        )
+        t_messages = []
+        if teacher_system_prompt:
+            t_messages.append({"role": "system", "content": teacher_system_prompt})
+        t_messages.append({"role": "user", "content": teacher_content})
+        t_text = tokenizer.apply_chat_template(
+            t_messages, tokenize=False, add_generation_prompt=True
+        )
+
+        return (
+            _tokenize_len(s_text) <= max_prompt_length
+            and _tokenize_len(t_text) <= max_prompt_length
+        )
+
+    filtered = dataset.filter(_fits, num_proc=4)
+    removed = initial_len - len(filtered)
+    print(
+        f"  Filtered out {removed}/{initial_len} samples exceeding "
+        f"{max_prompt_length} prompt tokens ({len(filtered)} remaining)"
+    )
+    return filtered
 
 
 # ── Model & vLLM ─────────────────────────────────────────────────────────────
@@ -368,6 +421,13 @@ def train(config):
     tokenizer = load_tokenizer(config)
     train_ds, _eval_ds = load_datasets(config)
 
+    max_prompt_length = sdft_cfg.get("max_prompt_length", 1024)
+    student_system = sdft_cfg.get("student_system_prompt")
+    teacher_system = sdft_cfg.get("teacher_system_prompt")
+    train_ds = filter_long_prompts(
+        train_ds, tokenizer, max_prompt_length, student_system, teacher_system
+    )
+
     # ── Algorithm 1, line 1: ϕ = θ ────────────────────────────────────────────
     print("Loading student model (πθ)...")
     student = load_student_model(config)
@@ -386,15 +446,11 @@ def train(config):
     grad_accum = train_cfg.get("gradient_accumulation_steps", 1)
     num_epochs = train_cfg.get("num_train_epochs", 1)
     lr = float(train_cfg.get("learning_rate", 1e-5))
-    max_prompt_length = sdft_cfg.get("max_prompt_length", 1024)
     kl_temperature = sdft_cfg.get("kl_temperature", 1.0)
     ema_alpha = sdft_cfg.get("ema_alpha", 0.02)
     mask_first_n = sdft_cfg.get("mask_first_n_tokens", 0)
     steps_per_gen = sdft_cfg.get("steps_per_generation", 4)
     gen_batch_size = batch_size * steps_per_gen
-
-    student_system = sdft_cfg.get("student_system_prompt")
-    teacher_system = sdft_cfg.get("teacher_system_prompt")
 
     # DataLoader – yields D = {(xi, ci)} batches
     dataloader = DataLoader(

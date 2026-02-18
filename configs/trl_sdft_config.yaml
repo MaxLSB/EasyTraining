@@ -31,8 +31,6 @@ sdft:
   steps_per_generation: 4
   disable_dropout: true
   vllm_gpu_memory_utilization: 0.4
-  student_system_prompt: null
-  teacher_system_prompt: null
 
 training:
   output_dir: ./training_results/sdft_test
