@@ -229,7 +229,6 @@ def build_distil_config(config):
         # ── Distil: generation ───────────────────────────────────────────
         max_prompt_length=distil_cfg.get("max_prompt_length", 1024),
         max_completion_length=distil_cfg.get("max_completion_length", 1024),
-        num_generations=distil_cfg.get("num_generations", 1),
         temperature=distil_cfg.get("temperature", 1.0),
         top_p=distil_cfg.get("top_p", 1.0),
         top_k=distil_cfg.get("top_k"),
@@ -239,7 +238,6 @@ def build_distil_config(config):
         # ── Distil: KL / loss ────────────────────────────────────────────
         alpha=distil_cfg.get("alpha", 1.0),
         beta=distil_cfg.get("beta", 0.0),
-        loss_type=distil_cfg.get("loss_type", "dapo"),
         num_loss_tokens_to_skip=distil_cfg.get("num_loss_tokens_to_skip", 0),
         mask_truncated_completions=distil_cfg.get("mask_truncated_completions", False),
         top_entropy_quantile=distil_cfg.get("top_entropy_quantile", 1.0),
@@ -299,10 +297,10 @@ def train(config):
     if eval_ds is not None:
         eval_ds = build_teacher_prompts(eval_ds, config)
 
-    # # Filter long prompts (disabled for now)
-    # train_ds = filter_long_prompts(train_ds, tokenizer, max_prompt_length)
-    # if eval_ds is not None:
-    #     eval_ds = filter_long_prompts(eval_ds, tokenizer, max_prompt_length)
+    # Filter long prompts
+    train_ds = filter_long_prompts(train_ds, tokenizer, max_prompt_length)
+    if eval_ds is not None:
+        eval_ds = filter_long_prompts(eval_ds, tokenizer, max_prompt_length)
 
     # Load student and teacher (reference) models
     print("Loading student model...")

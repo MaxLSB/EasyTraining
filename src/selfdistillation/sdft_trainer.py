@@ -1,11 +1,10 @@
 import inspect
 import os
-import textwrap
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Optional, Union
 
 import datasets
 import torch
@@ -14,7 +13,6 @@ import transformers
 from accelerate import logging
 from accelerate.utils import (
     broadcast_object_list,
-    gather,
     gather_object,
     is_peft_model,
     set_seed,
@@ -25,9 +23,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, Sampler
 from transformers import (
     AutoConfig,
-    AutoModelForSequenceClassification,
     AutoProcessor,
-    AutoTokenizer,
     GenerationConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
@@ -40,25 +36,22 @@ from transformers.utils import (
     is_datasets_available,
     is_flash_attn_2_available,
     is_peft_available,
-    is_rich_available,
 )
 
 from trl.data_utils import (
-    apply_chat_template,
     is_conversational,
     maybe_apply_chat_template,
     prepare_multimodal_messages,
 )
 from trl.extras.profiling import profiling_context, profiling_decorator
 from trl.extras.vllm_client import VLLMClient
-from trl.import_utils import is_liger_kernel_available, is_vllm_available
+from trl.import_utils import is_vllm_available
 from trl.models import (
     prepare_deepspeed,
     prepare_fsdp,
     prepare_peft_model,
     unwrap_model_for_generation,
 )
-from trl.models.utils import _ForwardRedirection
 from trl.trainer.base_trainer import BaseTrainer
 from sdft_config import DistilConfig
 from accelerate.state import AcceleratorState
@@ -68,11 +61,7 @@ from trl.trainer.utils import (
     ensure_master_addr_port,
     entropy_from_logits,
     identity,
-    nanmax,
-    nanmin,
-    nanstd,
     pad,
-    print_prompt_completions_sample,
     selective_log_softmax,
     shuffle_sequence_dict,
     split_pixel_values_by_grid,
@@ -166,100 +155,8 @@ class MemoryEfficientSyncRefModelCallback(TrainerCallback):
             )
 
 
-# What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
-# rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
-RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
-
-
 class DistilTrainer(BaseTrainer):
-    """
-    Trainer for the Self-Distillation method.
-
-    Example:
-
-    ```python
-    from datasets import load_dataset
-    from trl import DistilTrainer
-
-    dataset = load_dataset("trl-lib/tldr", split="train")
-
-
-    def reward_func(completions, **kwargs):
-        # Dummy reward function that rewards completions with more unique letters.
-        return [float(len(set(completion))) for completion in completions]
-
-
-    trainer = DistilTrainer(
-        model="Qwen/Qwen2-0.5B-Instruct",
-        reward_funcs=reward_func,
-        train_dataset=dataset,
-    )
-
-    trainer.train()
-    ```
-
-    Args:
-        model (`Union[str, PreTrainedModel]`):
-            Model to be trained. Can be either:
-
-            - A string, being the *model id* of a pretrained model hosted inside a model repo on huggingface.co, or a
-              path to a *directory* containing model weights saved using
-              [`~transformers.PreTrainedModel.save_pretrained`], e.g., `'./my_model_directory/'`. The model is loaded
-              using [`~transformers.AutoModelForCausalLM.from_pretrained`] with the keyword arguments in
-              `args.model_init_kwargs`.
-            - A [`~transformers.PreTrainedModel`] object. Only causal language models are supported.
-        reward_funcs (`Union[RewardFunc, list[RewardFunc]]`):
-            Reward functions to be used for computing the rewards. To compute the rewards, we call all the reward
-            functions with the prompts and completions and sum the rewards. Can be either:
-
-            - A single reward function, such as:
-                - A string: The *model ID* of a pretrained model hosted inside a model repo on huggingface.co, or a
-                path to a *directory* containing model weights saved using
-                [`~transformers.PreTrainedModel.save_pretrained`], e.g., `'./my_model_directory/'`. The model is loaded
-                using [`~transformers.AutoModelForSequenceClassification.from_pretrained`] with `num_labels=1` and the
-                keyword arguments in `args.model_init_kwargs`.
-                - A [`~transformers.PreTrainedModel`] object: Only sequence classification models are supported.
-                - A custom reward function: The function is provided with the prompts and the generated completions,
-                  plus any additional columns in the dataset. It should return a list of rewards. Custom reward
-                  functions can also return `None` when the reward is not applicable to those samples. This is useful
-                  for multi-task training where different reward functions apply to different types of samples. When a
-                  reward function returns `None` for a sample, that reward function is excluded from the reward
-                  calculation for that sample. For more details, see [Using a custom reward
-                  function](#using-a-custom-reward-function).
-
-                  The trainer's state is also passed to the reward function. The trainer's state is an instance of
-                  [`~transformers.TrainerState`] and can be accessed by accessing the `trainer_state` argument to the
-                  reward function's signature.
-            - A list of reward functions, where each item can independently be any of the above types. Mixing different
-            types within the list (e.g., a string model ID and a custom reward function) is allowed.
-        args ([`DistilConfig`], *optional*):
-            Configuration for this trainer. If `None`, a default configuration is used.
-        train_dataset ([`~datasets.Dataset`] or [`~datasets.IterableDataset`]):
-            Dataset to use for training. It must include a column `"prompt"`. Any additional columns in the dataset is
-            ignored. The format of the samples can be either:
-
-            - [Standard](dataset_formats#standard): Each sample contains plain text.
-            - [Conversational](dataset_formats#conversational): Each sample contains structured messages (e.g., role
-              and content).
-        eval_dataset ([`~datasets.Dataset`], [`~datasets.IterableDataset`] or `dict[str, Union[Dataset, IterableDataset]]`):
-            Dataset to use for evaluation. It must meet the same requirements as `train_dataset`.
-        processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.ProcessorMixin`], *optional*):
-            Processing class used to process the data. The padding side must be set to "left". If `None`, the
-            processing class is loaded from the model's name with [`~transformers.AutoProcessor.from_pretrained`]. A
-            padding token, `tokenizer.pad_token`, must be set. If the processing class has not set a padding token,
-            `tokenizer.eos_token` will be used as the default.
-        callbacks (list of [`~transformers.TrainerCallback`], *optional*):
-            List of callbacks to customize the training loop. Will add those to the list of default callbacks detailed
-            in [here](https://huggingface.co/docs/transformers/main_classes/callback).
-
-            If you want to remove one of the default callbacks used, use the [`~transformers.Trainer.remove_callback`]
-            method.
-        optimizers (`tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]`, *optional*, defaults to `(None, None)`):
-            A tuple containing the optimizer and the scheduler to use. Will default to an instance of [`AdamW`] on your
-            model and a scheduler given by [`get_linear_schedule_with_warmup`] controlled by `args`.
-        peft_config ([`~peft.PeftConfig`], *optional*):
-            PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
-    """
+    """Trainer for the Self-Distillation method."""
 
     _tag_names = ["trl", "distil"]
     _name = "Distil"
@@ -355,7 +252,6 @@ class DistilTrainer(BaseTrainer):
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
         self.max_completion_length = args.max_completion_length
-        self.num_generations = args.num_generations
         self.temperature = args.temperature
         self.top_p = args.top_p
         self.top_k = args.top_k
@@ -370,13 +266,6 @@ class DistilTrainer(BaseTrainer):
         self.vllm_tensor_parallel_size = (
             args.vllm_tensor_parallel_size
         )  # only applies to colocation mode
-        self.vllm_importance_sampling_correction = (
-            args.vllm_importance_sampling_correction
-        )
-        self.vllm_importance_sampling_cap = args.vllm_importance_sampling_cap
-        self.loss_type = args.loss_type
-        self.scale_rewards = args.scale_rewards
-        self.importance_sampling_level = args.importance_sampling_level
         self.mask_truncated_completions = args.mask_truncated_completions
         self.top_entropy_quantile = args.top_entropy_quantile
         self.num_loss_tokens_to_skip = args.num_loss_tokens_to_skip
@@ -397,24 +286,14 @@ class DistilTrainer(BaseTrainer):
                 "Iterable datasets are not yet supported in DistilTrainer. Please use a standard dataset instead."
             )
 
-        # Multi-step
-        self.num_iterations = args.num_iterations
-        self.epsilon_low = args.epsilon
-        self.epsilon_high = (
-            args.epsilon_high if args.epsilon_high is not None else args.epsilon
-        )
-        # Tracks the number of iterations (forward + backward passes), including those within a grad accum cycle
         self._step = 0
-        # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
-        # `_get_train_sampler` and `_prepare_inputs`.
         self._buffered_inputs = None
 
-        # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
-        # input tensor associated with the key "input_ids". However, in GRPO-like algorithms, the sampled data does not include the
-        # "input_ids" key. Instead, the available keys is "prompt". As a result, the trainer issues the warning:
+        # The trainer estimates the number of FLOPs using the number of elements in the input tensor associated with
+        # the key "input_ids". However, the sampled data does not include the "input_ids" key. Instead, the available
+        # key is "prompt". As a result, the trainer issues the warning:
         # "Could not estimate the number of tokens of the input, floating-point operations will not be computed." To
         # suppress this warning, we set the "estimate_tokens" key in the model's "warnings_issued" dictionary to True.
-        # This acts as a flag to indicate that the warning has already been issued.
         model.warnings_issued["estimate_tokens"] = True
 
         super().__init__(
@@ -427,17 +306,14 @@ class DistilTrainer(BaseTrainer):
             callbacks=callbacks,
             optimizers=optimizers,
             # In Trainer, `training_step` scales the loss by `gradient_accumulation_steps` only if `compute_loss_func`
-            # is None. For DAPO, loss scaling instead depends on the total number of completions tokens across the
-            # global accumulated batch. To control scaling ourselves, we must disable Trainer’s built-in scaling. The
-            # simplest (though a bit hacky) way is to set `compute_loss_func` to any non-None value, which bypasses
-            # that behavior without rewriting `training_step`.
+            # is None. To control scaling ourselves, we must disable Trainer's built-in scaling. The simplest (though a
+            # bit hacky) way is to set `compute_loss_func` to any non-None value, which bypasses that behavior without
+            # rewriting `training_step`.
             compute_loss_func="non-None value to disable scaling",
         )
 
-        # Reference model
         self.beta = args.beta
         self.alpha = args.alpha
-        # self.full_logit_distillation = args.full_logit_distillation
         self.generate_from_teacher = args.generate_from_teacher
         if ref_model is not None:
             # If a reference model is provided, use it
@@ -463,22 +339,15 @@ class DistilTrainer(BaseTrainer):
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
-        self._total_train_tokens = 0
         self.log_completions = args.log_completions
-        self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
-        self.num_completions_to_print = args.num_completions_to_print
-        # Keep logs sized to the generation batch to record only outputs from the latest model update.
         self._logs = {
             "images": deque(maxlen=args.generation_batch_size),
             "prompt": deque(maxlen=args.generation_batch_size),
             "completion": deque(maxlen=args.generation_batch_size),
-            "rewards": defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
-            "advantages": deque(maxlen=args.generation_batch_size),
         }
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
-        # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
-        # it's safer to set it in all cases.
+        # transformers. We could skip it if we use vLLM, but it's safer to set it in all cases.
         set_seed(args.seed, device_specific=True)
 
         if self.use_vllm:
@@ -554,7 +423,7 @@ class DistilTrainer(BaseTrainer):
                     else model.name_or_path
                 )
                 logger.info(
-                    f"[DEBUG] Initializing vLLM with model: {vllm_model_path}, generate_from_teacher={self.generate_from_teacher}"
+                    f"Initializing vLLM with model: {vllm_model_path}, generate_from_teacher={self.generate_from_teacher}"
                 )
                 self.llm = LLM(
                     model=vllm_model_path,
@@ -689,97 +558,25 @@ class DistilTrainer(BaseTrainer):
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
     def _get_train_sampler(self, dataset: Optional[Dataset] = None) -> Sampler:
-        # Returns a sampler that
-        # 1. ensures each prompt is repeated across multiple processes. This guarantees that identical prompts are
-        #    distributed to different GPUs, allowing rewards to be computed and normalized correctly within each prompt
-        #    group. Using the same seed across processes ensures consistent prompt assignment, preventing discrepancies
-        #    in group formation.
-        # 2. repeats the batch multiple times to allow reusing generations across multiple updates. Refer to
-        #    _prepare_inputs to see how the generations are stored and reused.
-
-        # In the following figure, the values are the prompt indices. The first row shows the first sampled batch, the
-        # second row shows the second sampled batch, and so on.
-        #
-        #                                      |   GPU 0  |   GPU 1  |
-        #
-        #                 global_step   step    <-───>  num_generations=2
-        #                                       <-───────> per_device_train_batch_size=3
-        #  grad_accum    ▲  ▲  0          0     0   0   1   1   2   2   <- Generate for the first `steps_per_generation` (prompts 0 to 11); store the completions; use the first slice to compute the loss
-        #     =2         ▼  |  0          1     3   3   4   4   5   5   <- Take the stored generations and use the second slice to compute the loss
-        #                   |
-        #                   |  1          2     6   6   7   7   8   8   <- Take the stored generations and use the third slice to compute the loss
-        #  steps_per_gen=4  ▼  1          3     9   9  10  10  11  11   <- Take the stored generations and use the fourth slice to compute the loss
-        #
-        #                      2          4    12  12  13  13  14  14   <- Generate for the second `steps_per_generation` (prompts 12 to 23); store the completions; use the first slice to compute the loss
-        #                      2          5    15  15  16  16  17  17   <- Take the stored generations and use the second slice to compute the loss
-        #                                          ...
+        # Returns a sampler that repeats the batch to allow reusing generations across multiple accumulation steps.
+        # Refer to _prepare_inputs to see how the generations are stored and reused.
         if dataset is None:
             dataset = self.train_dataset
         return RepeatSampler(
             data_source=dataset,
-            mini_repeat_count=self.num_generations,
-            batch_size=self.args.generation_batch_size // self.num_generations,
-            repeat_count=self.num_iterations * self.args.steps_per_generation,
+            mini_repeat_count=1,
+            batch_size=self.args.generation_batch_size,
+            repeat_count=self.args.steps_per_generation,
             shuffle=self.shuffle_dataset,
             seed=self.args.seed,
         )
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
-        # See _get_train_sampler for an explanation of the sampler.
         return RepeatSampler(
             data_source=eval_dataset,
-            mini_repeat_count=self.num_generations,
+            mini_repeat_count=1,
             seed=self.args.seed,
         )
-
-    @profiling_decorator
-    def _get_last_hidden_state(
-        self,
-        unwrapped_model,
-        input_ids,
-        attention_mask,
-        logits_to_keep,
-        pixel_values=None,
-        image_grid_thw=None,
-        pixel_attention_mask=None,
-        image_sizes=None,
-    ):
-        if is_peft_model(unwrapped_model):
-            unwrapped_model = unwrapped_model.base_model.model
-
-        # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
-        model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
-
-        # For Qwen models:
-        if image_grid_thw is not None and pixel_values is not None:
-            model_inputs["image_grid_thw"] = image_grid_thw
-        # For Gemma, SmolVLM2, LLaVa-Next etc.:
-        if pixel_values is not None:
-            model_inputs["pixel_values"] = pixel_values
-        # For SmolVLM2
-        if pixel_attention_mask is not None:
-            model_inputs["pixel_attention_mask"] = pixel_attention_mask
-        # For LLaVa-Next
-        if image_sizes is not None:
-            model_inputs["image_sizes"] = image_sizes
-
-        # Only add logits_to_keep if the model supports it
-        if "logits_to_keep" in self.model_kwarg_keys:
-            # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
-            model_inputs["logits_to_keep"] = logits_to_keep + 1
-
-        model_inputs["use_cache"] = (
-            False  # only used in generation; set False to suppress warnings
-        )
-
-        last_hidden_state = unwrapped_model.model(**model_inputs).last_hidden_state
-        # Exclude the last value: it corresponds to the next token pred
-        last_hidden_state = last_hidden_state[:, :-1, :]  # (B, L-1, H)
-        # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
-        last_hidden_state = last_hidden_state[
-            :, -logits_to_keep:, :
-        ]  # (B, logits_to_keep, H)
-        return last_hidden_state
 
     def get_high_entropy_mask(
         self, entropies: torch.Tensor, mask: torch.Tensor, threshold: float
@@ -1101,7 +898,7 @@ class DistilTrainer(BaseTrainer):
         #   - Generates completions once for the entire generation batch and splits it into batches of size
         #     `per_device_train_batch_size`
         #   - Buffers these completions and returns the appropriate slice for the current accumulation step
-        #   - Optimizes by regenerating completions only periodically (every steps_per_generation * num_iterations)
+        #   - Optimizes by regenerating completions only periodically (every steps_per_generation steps)
         # During evaluation:
         #   - The input is treated as a standard local batch (no accumulation, no multiple iterations)
         #   - Completions are generated for each batch without buffering or reuse
@@ -1109,8 +906,7 @@ class DistilTrainer(BaseTrainer):
 
         mode = "train" if self.model.training else "eval"
         if mode == "train":
-            generate_every = self.args.steps_per_generation * self.num_iterations
-            if self._step % generate_every == 0 or self._buffered_inputs is None:
+            if self._step % self.args.steps_per_generation == 0 or self._buffered_inputs is None:
                 # self._buffered_inputs=None can occur when resuming from a checkpoint
                 generation_batch = self._generate_and_score_completions(
                     generation_batch
@@ -1130,96 +926,6 @@ class DistilTrainer(BaseTrainer):
             # local generation batch == local eval batch
             inputs = self._generate_and_score_completions(generation_batch)
         return inputs
-
-    @profiling_decorator
-    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
-        device = self.accelerator.device
-        rewards_per_func = torch.zeros(
-            len(prompts), len(self.reward_funcs), device=device
-        )
-
-        # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
-        keys = [
-            key
-            for key in inputs[0]
-            if key not in ["prompt", "completion", "completion_ids"]
-        ]
-        reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-
-        # This allows for dynamic reward shaping based on training progress.
-        reward_kwargs["trainer_state"] = self.state
-
-        for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
-            zip(
-                self.reward_funcs,
-                self.reward_processing_classes,
-                self.reward_func_names,
-            )
-        ):
-            with profiling_context(self, reward_func_name):
-                if isinstance(
-                    reward_func, nn.Module
-                ):  # Module (no PretrainedModel) for compat with compiled models
-                    if is_conversational(inputs[0]):
-                        messages = [
-                            {"messages": p + c} for p, c in zip(prompts, completions)
-                        ]
-                        texts = [
-                            apply_chat_template(x, reward_processing_class)["text"]
-                            for x in messages
-                        ]
-                    else:
-                        texts = [p + c for p, c in zip(prompts, completions)]
-                    reward_inputs = reward_processing_class(
-                        text=texts,
-                        return_tensors="pt",
-                        padding=True,
-                        padding_side="right",
-                        add_special_tokens=False,
-                    )
-                    reward_inputs = super()._prepare_inputs(reward_inputs)
-                    with torch.inference_mode():
-                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[
-                            :, 0
-                        ]  # Shape (B*G,)
-                else:
-                    output_reward_func = reward_func(
-                        prompts=prompts,
-                        completions=completions,
-                        completion_ids=completion_ids_list,
-                        **reward_kwargs,
-                    )
-                    # Convert None values to NaN
-                    output_reward_func = [
-                        reward if reward is not None else torch.nan
-                        for reward in output_reward_func
-                    ]
-
-                    rewards_per_func[:, i] = torch.tensor(
-                        output_reward_func, dtype=torch.float32, device=device
-                    )
-
-        # If all reward functions return None for a given row, issue a detailed warning
-        if torch.isnan(rewards_per_func).all(dim=1).any():
-            nan_row_idx = (
-                torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
-            )
-            row_reward_kwargs = {
-                key: value[nan_row_idx]
-                for key, value in reward_kwargs.items()
-                if key != "trainer_state"
-            }
-            row_reward_kwargs["prompt"] = prompts[nan_row_idx]
-            row_reward_kwargs["completion"] = completions[nan_row_idx]
-            logger.warning(
-                f"All reward functions returned None for the following kwargs:\n{row_reward_kwargs}\n"
-                "Please ensure that at least one reward function returns a valid reward."
-            )
-
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
-        rewards_per_func = gather(rewards_per_func)
-        return rewards_per_func
 
     def _generate_single_turn(self, prompts: list[str], images: Optional[list]):
         device = self.accelerator.device
@@ -1279,21 +985,11 @@ class DistilTrainer(BaseTrainer):
                     all_images = gather_object(images)
 
                 if self.accelerator.is_main_process:
-                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                    # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                    # prompt individually.
-                    ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
-
-                    if images is not None:
-                        ordered_set_of_images = all_images[:: self.num_generations]
-                    else:
-                        ordered_set_of_images = None
-
                     with profiling_context(self, "vLLM.generate"):
                         output = self.vllm_client.generate(
-                            prompts=ordered_set_of_prompts,
-                            images=ordered_set_of_images,
-                            n=self.num_generations,
+                            prompts=all_prompts_text,
+                            images=all_images if images is not None else None,
+                            n=1,
                             repetition_penalty=self.repetition_penalty,
                             temperature=self.temperature,
                             top_p=self.top_p,
@@ -1316,11 +1012,6 @@ class DistilTrainer(BaseTrainer):
                 broadcast_object_list(obj_list, from_process=0)
                 all_prompt_ids, all_completion_ids, all_logprobs = obj_list[0]
 
-                # At this point, we only get 1 copy of each prompt, so we need to repeat them num_generations times
-                all_prompt_ids = [
-                    ids for ids in all_prompt_ids for _ in range(self.num_generations)
-                ]
-
                 process_slice = slice(
                     self.accelerator.process_index * len(prompts),
                     (self.accelerator.process_index + 1) * len(prompts),
@@ -1332,7 +1023,7 @@ class DistilTrainer(BaseTrainer):
             # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":
                 generation_kwargs = {
-                    "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
+                    "n": 1,
                     "repetition_penalty": self.repetition_penalty,
                     "temperature": self.temperature,
                     "top_p": self.top_p,
@@ -1546,9 +1237,7 @@ class DistilTrainer(BaseTrainer):
         agg_prompt_lengths = self.accelerator.gather(prompt_lengths)
         agg_completion_lengths = self.accelerator.gather(completion_lengths)
         total_prompt_tokens = agg_prompt_lengths.sum()
-        total_completion_tokens = (
-            agg_completion_lengths.sum()
-        )  # = num_items_in_batch, required for the DAPO loss
+        total_completion_tokens = agg_completion_lengths.sum()
 
         # Log the metrics
         if mode == "train":
@@ -1770,50 +1459,6 @@ class DistilTrainer(BaseTrainer):
         )
 
         with torch.no_grad():
-            # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
-            # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
-            # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
-            # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
-            # old_per_token_logps to None.
-            # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
-            # distribution mismatch between vLLM and the training model can be large and harm the training.
-            # Skip when generate_from_teacher=True since importance sampling is not used in that case.
-            generate_every = (
-                self.args.steps_per_generation * self.num_iterations
-            )  # generation frequency
-            if not self.generate_from_teacher and (
-                self.args.gradient_accumulation_steps % generate_every != 0
-                or (self.use_vllm and self.vllm_importance_sampling_correction)
-            ):
-                old_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
-                    self.model,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    num_images=num_images,
-                    compute_all_logps=False,
-                    **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
-                )
-            else:
-                old_per_token_logps = None
-
-            # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
-            # Skip when generate_from_teacher=True since vLLM has teacher weights (no mismatch to correct)
-            if (
-                self.use_vllm
-                and self.vllm_importance_sampling_correction
-                and not self.generate_from_teacher
-            ):
-                importance_sampling_ratio = torch.exp(
-                    old_per_token_logps - sampling_per_token_logps
-                )
-                importance_sampling_ratio = torch.clamp(
-                    importance_sampling_ratio, max=self.vllm_importance_sampling_cap
-                )
-            else:
-                importance_sampling_ratio = None
-
             # Compute the per-token log probabilities for the reference model
             if self.beta != 0.0:
                 if self.ref_model is not None:
@@ -1863,81 +1508,11 @@ class DistilTrainer(BaseTrainer):
         else:
             completions = completions_text
 
-        # Not really necessary, but keeping for now
-        rewards = torch.zeros_like(completion_ids, dtype=torch.float32)
-        advantages = rewards
-
-        # Keep a copy for logging (data is already local to each process, no slicing needed)
-        all_process_advantages = advantages.clone()
-
-        # Log prompt and completion texts
         self._logs["prompt"].extend(gather_object(prompts_text))
         self._logs["completion"].extend(gather_object(completions_text))
-        self._logs["rewards"]["main"].extend(
-            gather_object(rewards.mean(dim=-1).tolist())
-        )
-        self._logs["advantages"].extend(
-            gather_object(all_process_advantages.mean(dim=-1).tolist())
-        )
-        reward_to_log = rewards.clone()
-        reward_to_log = reward_to_log[completion_mask.bool()]
-        mean_reward = (
-            torch.mean(reward_to_log)
-            if reward_to_log.numel() > 0
-            else torch.tensor(0.0, device=device)
-        )
-        self._metrics[mode]["rewards"].append(
-            self.accelerator.gather(mean_reward).mean().item()
-        )
 
         if images is not None:
             self._logs["images"].extend(gather_object(images))
-
-        if importance_sampling_ratio is not None:
-            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
-            delta = delta[completion_mask.bool()]
-            mean_delta = (
-                torch.mean(delta)
-                if delta.numel() > 0
-                else torch.tensor(0.0, device=device)
-            )
-            max_delta = (
-                torch.max(delta)
-                if delta.numel() > 0
-                else torch.tensor(0.0, device=device)
-            )
-            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
-                self.accelerator.gather(mean_delta).mean().item()
-            )
-            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
-                self.accelerator.gather(max_delta).max().item()
-            )
-
-            flat_is_ratio = importance_sampling_ratio[completion_mask.bool()]
-            min_importance_sampling_ratio = (
-                torch.min(flat_is_ratio)
-                if flat_is_ratio.numel() > 0
-                else torch.tensor(0.0, device=device)
-            )
-            mean_importance_sampling_ratio = (
-                torch.mean(flat_is_ratio)
-                if flat_is_ratio.numel() > 0
-                else torch.tensor(0.0, device=device)
-            )
-            max_importance_sampling_ratio = (
-                torch.max(flat_is_ratio)
-                if flat_is_ratio.numel() > 0
-                else torch.tensor(0.0, device=device)
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
-                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
-                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
-                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
-            )
 
         output = {
             "prompt_ids": prompt_ids,
@@ -1946,13 +1521,8 @@ class DistilTrainer(BaseTrainer):
             "completion_mask": completion_mask,
             "teacher_prompt_ids": teacher_prompt_ids,
             "teacher_prompt_mask": teacher_prompt_mask,
-            "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
         }
-        if old_per_token_logps is not None:
-            output["old_per_token_logps"] = old_per_token_logps
-        if importance_sampling_ratio is not None:
-            output["importance_sampling_ratio"] = importance_sampling_ratio
         if ref_per_token_logps is not None:
             output["ref_per_token_logps"] = ref_per_token_logps
         if "pixel_values" in forward_kwargs:
@@ -2098,18 +1668,6 @@ class DistilTrainer(BaseTrainer):
             kl_loss = alpha * kl_teacher + (1 - alpha) * kl_student
         per_token_loss = kl_loss.sum(-1)
 
-        if (
-            self.use_vllm
-            and self.vllm_importance_sampling_correction
-            and not self.generate_from_teacher
-        ):
-            ratio = inputs["importance_sampling_ratio"]
-            importance_weights = (ratio * loss_completion_mask).sum(
-                -1
-            ) / loss_completion_mask.sum(-1).clamp(min=1.0)
-            importance_weights = importance_weights.unsqueeze(-1)
-            per_token_loss = per_token_loss * importance_weights
-
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
@@ -2138,7 +1696,7 @@ class DistilTrainer(BaseTrainer):
         loss_completion_token_count = loss_completion_mask.sum().clamp(min=1.0)
 
         def masked_batch_mean(x):
-            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
+            if x.shape[1] == 1:
                 return x.mean()
             else:
                 return (x * loss_completion_mask).sum() / loss_completion_token_count
@@ -2174,10 +1732,8 @@ class DistilTrainer(BaseTrainer):
         mode = "train" if self.model.training else "eval"
         metrics = {
             key: sum(val) / len(val) for key, val in self._metrics[mode].items()
-        }  # average the metrics
+        }
 
-        # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
-        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
         if mode == "eval":
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
 
@@ -2186,16 +1742,6 @@ class DistilTrainer(BaseTrainer):
         self._metrics[mode].clear()
 
         if self.accelerator.is_main_process and self.log_completions:
-            if is_rich_available():
-                print_prompt_completions_sample(
-                    self._logs["prompt"],
-                    self._logs["completion"],
-                    self._logs["rewards"],
-                    self._logs["advantages"],
-                    self.state.global_step,
-                    self.num_completions_to_print,
-                )
-
             if (
                 self.args.report_to
                 and "wandb" in self.args.report_to
@@ -2207,21 +1753,16 @@ class DistilTrainer(BaseTrainer):
                     "step": [str(self.state.global_step)] * len(self._logs["prompt"]),
                     "prompt": self._logs["prompt"],
                     "completion": self._logs["completion"],
-                    **self._logs["rewards"],
-                    "advantage": self._logs["advantages"],
                 }
 
                 if self._logs["images"]:
                     table["images"] = []
                     for image_list in self._logs["images"]:
-                        # Convert images to wandb Image objects for proper visualization
                         table["images"].append(
                             [wandb.Image(image) for image in image_list]
                         )
 
                 df = pd.DataFrame(table)
-                if self.wandb_log_unique_prompts:
-                    df = df.drop_duplicates(subset=["prompt"])
                 wandb.log({"completions": wandb.Table(dataframe=df)})
 
     # Ensure the model card is saved along with the checkpoint
