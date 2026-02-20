@@ -867,7 +867,9 @@ class DistilTrainer(BaseTrainer):
                 elif fsdp_version == 2:
                     self._sync_fsdp2_params_to_vllm(model_to_sync)
             else:
-                for name, param in model_to_sync.named_parameters():
+                # Unwrap potential DDP wrapper (e.g. ref_model prepared with accelerator.prepare_model)
+                unwrapped_model = self.accelerator.unwrap_model(model_to_sync)
+                for name, param in unwrapped_model.named_parameters():
                     name = self._fix_param_name_to_vllm(name)
                     with gather_if_zero3([param]):
                         if (

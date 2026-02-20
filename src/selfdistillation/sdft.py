@@ -17,6 +17,10 @@ from sdft_trainer import DistilTrainer
 from sdft_config import DistilConfig
 
 
+def is_main_process():
+    return int(os.environ.get("RANK", "0")) == 0
+
+
 def load_config(path):
     with open(path) as f:
         return yaml.safe_load(f)
@@ -53,7 +57,8 @@ def load_datasets(config):
         name, split = dcfg["name"], dcfg.get("split", "train")
         subset = dcfg.get("subset")
 
-        print(f"Loading dataset: {name} (split={split})")
+        if is_main_process():
+            print(f"Loading dataset: {name} (split={split})")
         ds = (
             load_dataset(name, name=subset, split=split)
             if subset
@@ -76,7 +81,8 @@ def load_datasets(config):
         keep_cols = {"prompt", "completion"} & set(ds.column_names)
         ds = ds.remove_columns([c for c in ds.column_names if c not in keep_cols])
         all_ds.append(ds)
-        print(f"  -> {len(ds)} samples (columns: {ds.column_names})")
+        if is_main_process():
+            print(f"  -> {len(ds)} samples (columns: {ds.column_names})")
 
     combined = concatenate_datasets(all_ds) if len(all_ds) > 1 else all_ds[0]
 
@@ -155,10 +161,11 @@ def filter_long_prompts(dataset, tokenizer, max_prompt_length, num_proc=4):
 
     filtered = dataset.filter(_fits, num_proc=num_proc)
     removed = initial_len - len(filtered)
-    print(
-        f"  Filtered out {removed}/{initial_len} samples exceeding "
-        f"{max_prompt_length} prompt tokens ({len(filtered)} remaining)"
-    )
+    if is_main_process():
+        print(
+            f"  Filtered out {removed}/{initial_len} samples exceeding "
+            f"{max_prompt_length} prompt tokens ({len(filtered)} remaining)"
+        )
     return filtered
 
 
@@ -188,6 +195,34 @@ def load_model(config):
     model = AutoModelForCausalLM.from_pretrained(model_cfg["name"], **load_kwargs)
     model.config.use_cache = False
     return model
+
+
+def build_lora_config(config):
+    lora_cfg = config.get("lora", {})
+    if not lora_cfg.get("enabled"):
+        return None
+    from peft import LoraConfig, TaskType
+
+    return LoraConfig(
+        r=lora_cfg.get("r", 16),
+        lora_alpha=lora_cfg.get("alpha", 16),
+        lora_dropout=lora_cfg.get("dropout", 0.0),
+        bias=lora_cfg.get("bias", "none"),
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=lora_cfg.get(
+            "target_modules",
+            [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+        ),
+        use_rslora=lora_cfg.get("use_rslora", False),
+    )
 
 
 def build_distil_config(config):
@@ -282,7 +317,8 @@ def setup_wandb(config):
 
 
 def train(config):
-    print(f"[Rank {os.environ.get('RANK', 0)}] Starting SDFT training")
+    if is_main_process():
+        print(f"[Rank {os.environ.get('RANK', 0)}] Starting SDFT training")
 
     setup_wandb(config)
     tokenizer = load_tokenizer(config)
@@ -292,7 +328,8 @@ def train(config):
     max_prompt_length = distil_cfg.get("max_prompt_length", 1024)
 
     # Build teacher prompts (CtxT) and format student prompts (CtxS)
-    print("Formatting teacher prompts...")
+    if is_main_process():
+        print("Formatting teacher prompts...")
     train_ds = build_teacher_prompts(train_ds, config)
     if eval_ds is not None:
         eval_ds = build_teacher_prompts(eval_ds, config)
@@ -302,13 +339,20 @@ def train(config):
     if eval_ds is not None:
         eval_ds = filter_long_prompts(eval_ds, tokenizer, max_prompt_length)
 
+    # Ensure all ranks finish data preprocessing before model loading
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
     # Load student and teacher (reference) models
-    print("Loading student model...")
+    if is_main_process():
+        print("Loading student model...")
     model = load_model(config)
-    print("Loading teacher (reference) model...")
+    if is_main_process():
+        print("Loading teacher (reference) model...")
     ref_model = load_model(config)
 
     distil_args = build_distil_config(config)
+    peft_config = build_lora_config(config)
 
     trainer = DistilTrainer(
         model=model,
@@ -317,6 +361,7 @@ def train(config):
         processing_class=tokenizer,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
+        peft_config=peft_config,
     )
 
     resume_from = (config.get("training") or {}).get("resume_from_checkpoint")
@@ -325,7 +370,8 @@ def train(config):
     outdir = config["training"].get("output_dir", "./outputs/sdft")
     trainer.save_model(outdir)
     tokenizer.save_pretrained(outdir)
-    print(f"SDFT training complete. Model saved to {outdir}")
+    if is_main_process():
+        print(f"SDFT training complete. Model saved to {outdir}")
 
 
 def main():

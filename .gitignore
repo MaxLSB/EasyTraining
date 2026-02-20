@@ -12,3 +12,5 @@ logs/
 training_results/
 **/__pycache__/
 backup_sdft/
+.vscode/
+outputs/
