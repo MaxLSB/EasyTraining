@@ -1,13 +1,11 @@
 import os
 import yaml
 import argparse
-import random
-import traceback
 
 import torch
 from datasets import load_dataset, concatenate_datasets, load_from_disk
 from pathlib import Path
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TrainerCallback
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, TaskType
 from trl import DPOTrainer, DPOConfig
 
@@ -18,11 +16,17 @@ def load_config(path):
 
 
 def is_chat_format(x):
-    return isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict) and "role" in x[0]
+    return (
+        isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict) and "role" in x[0]
+    )
 
 
 def get_torch_dtype(train_cfg):
-    if train_cfg.get("bf16") and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+    if (
+        train_cfg.get("bf16")
+        and torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported()
+    ):
         return torch.bfloat16
     if train_cfg.get("fp16"):
         return torch.float16
@@ -43,7 +47,11 @@ def load_split(path, split):
 
 def ensure_preference_columns(ds, colmap):
     for target, source in colmap.items():
-        if source != target and source in ds.column_names and target not in ds.column_names:
+        if (
+            source != target
+            and source in ds.column_names
+            and target not in ds.column_names
+        ):
             ds = ds.rename_column(source, target)
     for c in ("chosen", "rejected"):
         if c not in ds.column_names:
@@ -51,21 +59,32 @@ def ensure_preference_columns(ds, colmap):
     return ds
 
 
-def normalize_text(ds, num_proc=8):
-    def to_text(x):
-        if isinstance(x, str) or is_chat_format(x):
+def normalize_to_chat(ds, num_proc=8):
+    def to_chat(x, role):
+        if is_chat_format(x):
             return x
+        if isinstance(x, str):
+            return [{"role": role, "content": x}]
         if isinstance(x, list):
-            return "\n".join(
-                f'{m.get("role","")}: {m.get("content","")}' if isinstance(m, dict) else str(m)
+            text = "\n".join(
+                (
+                    f'{m.get("role","")}: {m.get("content","")}'
+                    if isinstance(m, dict)
+                    else str(m)
+                )
                 for m in x
             )
+            return [{"role": role, "content": text}]
         if isinstance(x, dict):
-            return x.get("content", str(x))
-        return str(x)
+            return [{"role": role, "content": x.get("content", str(x))}]
+        return [{"role": role, "content": str(x)}]
 
     def _map(ex):
-        return {k: to_text(ex.get(k, "")) for k in ("prompt", "chosen", "rejected")}
+        return {
+            "prompt": to_chat(ex.get("prompt", ""), "user"),
+            "chosen": to_chat(ex.get("chosen", ""), "assistant"),
+            "rejected": to_chat(ex.get("rejected", ""), "assistant"),
+        }
 
     return ds.map(_map, num_proc=num_proc)
 
@@ -75,17 +94,24 @@ def load_datasets(config):
     for dcfg in config.get("datasets", []):
         name, split = dcfg["name"], dcfg.get("split", "train")
         subset = dcfg.get("subset")
-        colmap = dcfg.get("column_map", {"prompt": "prompt", "chosen": "chosen", "rejected": "rejected"})
+        colmap = dcfg.get(
+            "column_map",
+            {"prompt": "prompt", "chosen": "chosen", "rejected": "rejected"},
+        )
 
         print(f"Loading dataset: {name} (split={split})")
-        ds = load_dataset(name, name=subset, split=split) if subset else load_split(name, split)
+        ds = (
+            load_dataset(name, name=subset, split=split)
+            if subset
+            else load_split(name, split)
+        )
 
         max_samples = dcfg.get("max_samples")
         if max_samples and max_samples > 0:
             ds = ds.select(range(min(max_samples, len(ds))))
 
         ds = ensure_preference_columns(ds, colmap)
-        ds = normalize_text(ds)
+        ds = normalize_to_chat(ds)
         all_ds.append(ds)
         print(f"  -> {len(ds)} samples")
 
@@ -95,8 +121,14 @@ def load_datasets(config):
     split_ratio = val_cfg.get("split_ratio", 0.0)
     split_size = val_cfg.get("split_size")
     if split_ratio > 0 or split_size:
-        val_size = min(split_size, len(combined)) if split_size else int(len(combined) * split_ratio)
-        splits = combined.train_test_split(test_size=val_size, seed=val_cfg.get("seed", 42), shuffle=True)
+        val_size = (
+            min(split_size, len(combined))
+            if split_size
+            else int(len(combined) * split_ratio)
+        )
+        splits = combined.train_test_split(
+            test_size=val_size, seed=val_cfg.get("seed", 42), shuffle=True
+        )
         return splits["train"], splits["test"]
 
     return combined, None
@@ -110,13 +142,15 @@ def filter_overlength(ds, tokenizer, max_length, num_proc=8):
         return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
     def fits(ex):
-        full_chosen = ex["prompt"] + ex["chosen"] if is_chat_format(ex["prompt"]) else ex["prompt"] + ex["chosen"]
-        full_rejected = ex["prompt"] + ex["rejected"] if is_chat_format(ex["prompt"]) else ex["prompt"] + ex["rejected"]
+        full_chosen = ex["prompt"] + ex["chosen"]
+        full_rejected = ex["prompt"] + ex["rejected"]
         return max(token_len(full_chosen), token_len(full_rejected)) <= max_length
 
     before = len(ds)
     ds = ds.filter(fits, num_proc=num_proc)
-    print(f"  Length filter ({max_length} tokens): {before} -> {len(ds)} (dropped {before - len(ds)})")
+    print(
+        f"  Length filter ({max_length} tokens): {before} -> {len(ds)} (dropped {before - len(ds)})"
+    )
     return ds
 
 
@@ -137,7 +171,14 @@ def load_model(config):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     torch_dtype = get_torch_dtype(train_cfg)
-    is_ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    is_fsdp = bool(train_cfg.get("fsdp"))
+
+    if model_cfg.get("load_in_4bit") and is_fsdp:
+        raise ValueError(
+            "4-bit quantization (BitsAndBytes) is incompatible with FSDP. "
+            "Use LoRA without quantization, or disable FSDP."
+        )
 
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -155,13 +196,13 @@ def load_model(config):
         load_kwargs["attn_implementation"] = model_cfg["attn_implementation"]
     if model_cfg.get("rope_scaling"):
         load_kwargs["rope_scaling"] = model_cfg["rope_scaling"]
-    if not is_ddp and torch.cuda.is_available():
+
+    if not is_distributed and torch.cuda.is_available():
         load_kwargs["device_map"] = {"": local_rank}
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
-    if is_ddp and torch.cuda.is_available():
+    if is_distributed and torch.cuda.is_available():
         model.to(torch.device("cuda", local_rank))
-
     model.config.use_cache = False
     return model
 
@@ -176,10 +217,18 @@ def build_lora_config(config):
         lora_dropout=lora_cfg.get("dropout", 0.0),
         bias=lora_cfg.get("bias", "none"),
         task_type=TaskType.CAUSAL_LM,
-        target_modules=lora_cfg.get("target_modules", [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ]),
+        target_modules=lora_cfg.get(
+            "target_modules",
+            [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+        ),
         use_rslora=lora_cfg.get("use_rslora", False),
     )
 
@@ -195,9 +244,6 @@ def build_dpo_config(config):
 
     fsdp = train_cfg.get("fsdp")
 
-    model_init_kwargs = None
-    ref_model_init_kwargs = None
-    
     return DPOConfig(
         # Training
         output_dir=train_cfg.get("output_dir", "./outputs/dpo"),
@@ -224,109 +270,15 @@ def build_dpo_config(config):
         # FSDP
         fsdp=fsdp or "",
         fsdp_config=train_cfg.get("fsdp_config", {}),
-        model_init_kwargs=model_init_kwargs,
-        ref_model_init_kwargs=ref_model_init_kwargs,
         # DPO
         beta=dpo_cfg.get("beta", 0.1),
         loss_type=dpo_cfg.get("loss_type", "sigmoid"),
         max_length=dpo_cfg.get("max_length", 1024),
+        max_prompt_length=dpo_cfg.get("max_prompt_length", 512),
         truncation_mode=dpo_cfg.get("truncation_mode", "keep_end"),
         precompute_ref_log_probs=dpo_cfg.get("precompute_ref_log_probs", False),
         dataset_num_proc=dpo_cfg.get("dataset_num_proc"),
     )
-
-
-# ── Eval Callback ────────────────────────────────────────────────────────────
-
-
-class EvalSampleLoggerCallback(TrainerCallback):
-    """Generate and log model outputs on fixed eval prompts at each eval step."""
-
-    def __init__(self, tokenizer, eval_dataset, num_samples=5, max_new_tokens=256, use_wandb=False):
-        self.tokenizer = tokenizer
-        self.max_new_tokens = max_new_tokens
-        self.use_wandb = use_wandb
-        n = min(num_samples, len(eval_dataset))
-        self.samples = [eval_dataset[i] for i in random.sample(range(len(eval_dataset)), n)]
-
-    def _prompt_to_ids(self, prompt):
-        if is_chat_format(prompt):
-            out = self.tokenizer.apply_chat_template(prompt, return_tensors="pt", add_generation_prompt=True)
-            return out if isinstance(out, torch.Tensor) else out["input_ids"]
-        return self.tokenizer(prompt, return_tensors="pt")["input_ids"]
-
-    def _truncate(self, text, max_chars=500):
-        if isinstance(text, str):
-            return text[:max_chars]
-        if is_chat_format(text):
-            return "\n".join(f'{m["role"]}: {m.get("content","")}' for m in text)[:max_chars]
-        return str(text)[:max_chars]
-
-    @staticmethod
-    def _unwrap(model):
-        while hasattr(model, "module"):
-            model = model.module
-        return model
-
-    def on_evaluate(self, args, state, control, model=None, **kwargs):
-        if model is None:
-            return
-
-        is_main = int(os.environ.get("RANK", 0)) == 0
-        unwrapped = self._unwrap(model)
-        unwrapped.eval()
-
-        # Temporarily enable cache and disable gradient checkpointing for generation
-        had_gc = getattr(unwrapped, "gradient_checkpointing", False)
-        if had_gc:
-            unwrapped.gradient_checkpointing_disable()
-        unwrapped.config.use_cache = True
-
-        device = next(unwrapped.parameters()).device
-
-        rows = []
-        for sample in self.samples:
-            try:
-                input_ids = self._prompt_to_ids(sample["prompt"]).to(device)
-                attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
-                with torch.no_grad():
-                    out = unwrapped.generate(
-                        input_ids, attention_mask=attention_mask,
-                        max_new_tokens=self.max_new_tokens,
-                        do_sample=False, pad_token_id=self.tokenizer.pad_token_id,
-                        temperature=None, top_p=None, top_k=None,
-                    )
-                generated = self.tokenizer.decode(out[0][input_ids.shape[-1]:], skip_special_tokens=True)[:500]
-            except Exception as e:
-                traceback.print_exc()
-                generated = f"[generation failed: {e}]"
-
-            row = {k: self._truncate(sample[k]) for k in ("prompt", "chosen", "rejected")}
-            row["generated"] = generated
-            rows.append(row)
-
-            if is_main:
-                print(f"\n{'='*80}")
-                print(f"[Eval sample - step {state.global_step}]")
-                for k in ("prompt", "chosen", "rejected", "generated"):
-                    print(f"{k.upper():10s} {row[k][:300]}")
-                print("=" * 80)
-
-        unwrapped.config.use_cache = False
-        if had_gc:
-            unwrapped.gradient_checkpointing_enable()
-
-        if is_main and self.use_wandb:
-            try:
-                import wandb
-                if wandb.run:
-                    table = wandb.Table(
-                        columns=["prompt", "chosen", "rejected", "generated"],
-                        data=[[r[c] for c in ("prompt", "chosen", "rejected", "generated")] for r in rows],
-                    )
-                    wandb.log({"eval_samples": table, "global_step": state.global_step})
-            except Exception:
-                pass
 
 
 # ── Training ─────────────────────────────────────────────────────────────────
@@ -337,6 +289,7 @@ def setup_wandb(config):
     if not wandb_cfg.get("enabled") or int(os.environ.get("RANK", 0)) != 0:
         return
     import wandb
+
     wandb.init(
         project=wandb_cfg.get("project", "dpo-training"),
         entity=wandb_cfg.get("entity"),
@@ -365,17 +318,6 @@ def train(config):
     dpo_args = build_dpo_config(config)
     peft_config = build_lora_config(config)
 
-    callbacks = []
-    eval_samples_cfg = config.get("eval_samples", {})
-    if eval_ds and eval_samples_cfg.get("enabled", True):
-        callbacks.append(EvalSampleLoggerCallback(
-            tokenizer=tokenizer,
-            eval_dataset=eval_ds,
-            num_samples=eval_samples_cfg.get("num_samples", 5),
-            max_new_tokens=eval_samples_cfg.get("max_new_tokens", 256),
-            use_wandb=config.get("wandb", {}).get("enabled", False),
-        ))
-
     trainer = DPOTrainer(
         model=model,
         args=dpo_args,
@@ -383,13 +325,14 @@ def train(config):
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         peft_config=peft_config,
-        callbacks=callbacks or None,
     )
 
     resume_from = config.get("training", {}).get("resume_from_checkpoint")
     trainer.train(resume_from_checkpoint=resume_from)
 
     outdir = config["training"].get("output_dir", "./outputs/dpo")
+    if trainer.is_fsdp_enabled:
+        trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
     trainer.save_model(outdir)
     tokenizer.save_pretrained(outdir)
     print("DPO training complete.")

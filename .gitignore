@@ -1,11 +1,16 @@
 .python-version
 .venv/
+.venv-sdft/
 venv/
 env/
 venv/
-*.egg-info
+**.egg-info
 src/easytraining.egg-info
 .claude
 wandb/
 logs/
 training_results/
+**/__pycache__/
+backup_sdft/
+.vscode/
+outputs/

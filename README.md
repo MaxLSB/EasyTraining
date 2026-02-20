@@ -1,25 +1,47 @@
 # EasyTraining
 
-Config-driven DPO & SFT training with [TRL](https://github.com/huggingface/trl).
+Config-driven fine-tuning with TRL: SFT, DPO, and Self-Distillation (SDFT).
 
 ## Setup
 
+Two separate environments due to different dependency versions:
+
 ```bash
+# SFT / DPO
 make env
 source .venv/bin/activate
-make clean  # remove venv
+
+# Self-Distillation (vLLM, DeepSpeed)
+make env-sdft
+source .venv-sdft/bin/activate
 ```
 
 ```bash
-hf auth login --token hf_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX # Set you HF token
-wandb login # Set your wandb key
+hf auth login --token hf_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 
+wandb login
 ```
-
-
 
 ## Training
 
+All methods are config-driven and support multi-GPU setups via `torchrun`. Edit the YAML then launch:
+
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 src/dpo/trl_dpo.py --config configs/trl_dpo_config.yaml > logs/dpo_test.log 2>&1 &
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 src/sft/trl_sft.py --config configs/trl_sft_config.yaml > logs/sft_test.log 2>&1 &
+# SFT
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 src/sft/sft.py --config configs/sft_config.yaml
+
+# DPO
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 src/dpo/dpo.py --config configs/dpo_config.yaml
+
+# Self-Distillation
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 src/selfdistillation/sdft.py --config configs/sdft_config.yaml
+```
+
+Single GPU: drop `torchrun --nproc_per_node` and run with `python` directly.
+
+LoRA is supported for SFT and SDFT — add a `lora:` section in the config (see examples in `configs/`).
+
+## Cleanup
+
+```bash
+make clean  # remove all venvs
 ```

@@ -4,16 +4,41 @@ version = "0.1.0"
 description = "Config-driven DPO & SFT training with TRL"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = [
-    "torch==2.10.0",
-    "transformers==5.1.0",
-    "trl==0.28.0",
-    "datasets==4.5.0",
-    "accelerate==1.12.0",
+
+dependencies = []
+
+[project.optional-dependencies]
+train = [
     "peft==0.18.1",
     "bitsandbytes==0.49.1",
     "pyyaml==6.0.3",
-    "wandb==0.24.2",
+    "wandb==0.25.0",
+    "datasets==4.5.0",
+    "accelerate==1.12.0",
+    "trl==0.28.0",
+    "torch==2.10.0",
+    "transformers==5.1.0",
     "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.12/flash_attn-2.8.3%2Bcu128torch2.10-cp311-cp311-linux_x86_64.whl",
 ]
 
+sdft = [
+    "pyyaml==6.0.3",
+    "datasets==4.3.0",
+    "torch==2.9.0",
+    "transformers==4.57.1",
+    "accelerate==1.11.0",
+    "peft==0.17.1",
+    "rich==14.2.0",
+    "vllm==0.12.0",
+    "trl==0.24.0",
+    "openai==2.6.1",
+    "tqdm==4.67.1",
+    "numpy==2.2.6",
+    "scipy==1.15.3",
+    "matplotlib==3.10.7",
+    "flashinfer-python==0.5.3",
+    "wandb==0.25.0",
+    "pandas==2.3.3",
+    "deepspeed==0.18.4",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.9-cp311-cp311-linux_x86_64.whl"
+]
